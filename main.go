@@ -11,6 +11,7 @@ import (
 	"html"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,6 +28,26 @@ import (
 	"golang.org/x/sys/unix"
 	"golang.org/x/term"
 )
+
+func init() {
+	// Android/Termux does not provide /etc/resolv.conf.
+	// Providing a fallback DNS resolver ensures cross-compiled Go binaries
+	// can resolve domain names out-of-the-box on any Android device.
+	if _, err := os.Stat("/etc/resolv.conf"); os.IsNotExist(err) {
+		net.DefaultResolver = &net.Resolver{
+			PreferGo: true,
+			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+				d := net.Dialer{Timeout: 3 * time.Second}
+				for _, dns := range []string{"1.1.1.1:53", "8.8.8.8:53", "9.9.9.9:53"} {
+					if conn, err := d.DialContext(ctx, "udp", dns); err == nil {
+						return conn, nil
+					}
+				}
+				return d.DialContext(ctx, network, address)
+			},
+		}
+	}
+}
 
 const (
 	Version   = "1.1.0"

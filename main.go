@@ -704,21 +704,8 @@ func readKey(stdinFd int) string {
 	}
 }
 
-func downloadDashboard(item TorrentItem, destDir string) {
-	ensureAriaDaemon(destDir)
-
-	fd := int(os.Stdin.Fd())
-	fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
-	defer fmt.Print("\033[?25h\033[?1049l\r\n")
-
-	activeGID, err := addMagnet(item.Magnet, destDir)
-	if err != nil {
-		fmt.Printf("\r\n%s%s✖ Failed to start download: %v%s\r\n", Bold, Red, err, Reset)
-		fmt.Printf("\r\n%sPress any key to return to search...%s", Dim, Reset)
-		_ = readKey(fd)
-		return
-	}
-
+func runDownloadLoop(initialGID, defaultTitle, srcLabel, destDir string, fd int) {
+	activeGID := initialGID
 	statusMsg := ""
 	isPaused := false
 
@@ -753,7 +740,7 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			}
 		}
 
-		fileName := item.Title
+		fileName := defaultTitle
 		var filePath string
 		isMetadataPhase := true
 
@@ -766,7 +753,7 @@ func downloadDashboard(item TorrentItem, destDir string) {
 				if p != "" && !strings.HasPrefix(p, "[METADATA]") && !strings.HasPrefix(p, "[MEMORY]") {
 					isMetadataPhase = false
 					filePath = p
-					if fileName == item.Title {
+					if fileName == defaultTitle {
 						fileName = filepath.Base(p)
 					}
 				}
@@ -791,7 +778,6 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			divLen = 1
 		}
 
-		srcLabel := item.Source
 		if srcLabel == "ThePirateBay" {
 			srcLabel = "TPB"
 		}
@@ -866,7 +852,7 @@ func downloadDashboard(item TorrentItem, destDir string) {
 		if statusText == "complete" && !isMetadataPhase {
 			controls = fmt.Sprintf("%s[Enter/q]%s Return   %s[o]%s Open in Player", Bold, Reset, Bold, Reset)
 		} else if statusText == "removed" || statusText == "error" {
-			controls = fmt.Sprintf("%s[Enter/q]%s Return to Search", Bold, Reset)
+			controls = fmt.Sprintf("%s[Enter/q]%s Return", Bold, Reset)
 		} else {
 			pLabel := "Pause"
 			if isPaused {
@@ -917,6 +903,24 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			}
 		}
 	}
+}
+
+func downloadDashboard(item TorrentItem, destDir string) {
+	ensureAriaDaemon(destDir)
+
+	fd := int(os.Stdin.Fd())
+	fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
+	defer fmt.Print("\033[?25h\033[?1049l\r\n")
+
+	activeGID, err := addMagnet(item.Magnet, destDir)
+	if err != nil {
+		fmt.Printf("\r\n%s%s✖ Failed to start download: %v%s\r\n", Bold, Red, err, Reset)
+		fmt.Printf("\r\n%sPress any key to return to search...%s", Dim, Reset)
+		_ = readKey(fd)
+		return
+	}
+
+	runDownloadLoop(activeGID, item.Title, item.Source, destDir, fd)
 }
 
 func cancelDownloads(target string) {
@@ -991,133 +995,234 @@ func resumeDownloads(target string) {
 	fmt.Printf("%sInvalid download index: %s%s\n", Red, target, Reset)
 }
 
+func getTaskDisplayName(t AriaTask) string {
+	if t.Bittorrent != nil && t.Bittorrent.Info != nil && t.Bittorrent.Info.Name != "" {
+		return t.Bittorrent.Info.Name
+	}
+	if len(t.Files) > 0 && t.Files[0].Path != "" {
+		p := t.Files[0].Path
+		if strings.HasPrefix(p, "[METADATA]") {
+			clean := strings.TrimPrefix(p, "[METADATA]")
+			if unesc, err := url.QueryUnescape(clean); err == nil {
+				return unesc
+			}
+			return clean
+		}
+		return filepath.Base(p)
+	}
+	return "Active Torrent"
+}
+
 func queueManager(destDir string) {
 	ensureAriaDaemon(destDir)
-	fmt.Print(ClearScrn)
 
-	activeTasks := getActiveTasks()
-
-	type fileEntry struct {
-		name  string
-		size  int64
-		mtime time.Time
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err == nil {
+		defer term.Restore(fd, oldState)
 	}
+	fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
+	defer fmt.Print("\033[?25h\033[?1049l\r\n")
 
-	validExts := map[string]bool{
-		".mkv": true, ".mp4": true, ".avi": true, ".webm": true,
-		".zip": true, ".apk": true, ".iso": true, ".torrent": true,
-	}
+	selectedIdx := 0
+	statusMsg := ""
 
-	var files []fileEntry
-	if entries, err := os.ReadDir(destDir); err == nil {
-		for _, e := range entries {
-			if e.IsDir() {
-				continue
+	for {
+		cols, lines, err := term.GetSize(fd)
+		if err != nil || cols <= 0 {
+			cols, lines = 80, 24
+		}
+
+		activeTasks := getActiveTasks()
+		totalItems := len(activeTasks)
+
+		if totalItems == 0 {
+			selectedIdx = 0
+		} else {
+			if selectedIdx >= totalItems {
+				selectedIdx = totalItems - 1
 			}
-			ext := strings.ToLower(filepath.Ext(e.Name()))
-			if validExts[ext] && !strings.HasSuffix(e.Name(), ".aria2") {
-				if fi, err := e.Info(); err == nil {
-					files = append(files, fileEntry{
-						name:  e.Name(),
-						size:  fi.Size(),
-						mtime: fi.ModTime(),
-					})
+			if selectedIdx < 0 {
+				selectedIdx = 0
+			}
+		}
+
+		divLen := cols - 2
+		if divLen > 78 {
+			divLen = 78
+		}
+		if divLen < 1 {
+			divLen = 1
+		}
+
+		var frame []string
+		hdr := fmt.Sprintf("%s%s⚡ TORQ ACTIVE DOWNLOAD QUEUE%s %s───%s %s%d Active%s", Bold, Cyan, Reset, Dim, Reset, Yellow, totalItems, Reset)
+		frame = append(frame, "\r"+hdr+ClearLine)
+		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+
+		if totalItems == 0 {
+			frame = append(frame, "\r"+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("   %sℹ No active or paused downloads in queue.%s", Yellow, Reset)+ClearLine)
+			frame = append(frame, "\r"+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("   %sSearch & start any download anytime using:%s", Dim, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("   %s%storq \"<media name>\"%s", Bold, White, Reset)+ClearLine)
+			frame = append(frame, "\r"+ClearLine)
+		} else {
+			for idx, t := range activeTasks {
+				isActive := (idx == selectedIdx)
+				tName := getTaskDisplayName(t)
+				maxTitle := cols - 16
+				if maxTitle < 12 {
+					maxTitle = 12
+				}
+				titleDisp := truncateRunes(tName, maxTitle)
+
+				tot, _ := strconv.ParseInt(t.TotalLength, 10, 64)
+				done, _ := strconv.ParseInt(t.CompletedLength, 10, 64)
+				spd, _ := strconv.ParseInt(t.DownloadSpeed, 10, 64)
+				seeders, _ := strconv.Atoi(t.NumSeeders)
+				conns, _ := strconv.Atoi(t.Connections)
+
+				isMeta := false
+				if len(t.Files) > 0 && (strings.HasPrefix(t.Files[0].Path, "[METADATA]") || strings.HasPrefix(t.Files[0].Path, "[MEMORY]")) {
+					isMeta = true
+				}
+
+				pct := 0.0
+				if tot > 0 && !isMeta {
+					pct = (float64(done) / float64(tot)) * 100.0
+				}
+				var etaSec int64
+				if spd > 0 && tot > done {
+					etaSec = (tot - done) / spd
+				}
+
+				var line1 string
+				if isActive {
+					line1 = fmt.Sprintf(" %s %s[%2d]%s %s%s%s", HlArrow, Cyan, idx+1, Reset, HlBg, titleDisp, Reset)
+				} else {
+					line1 = fmt.Sprintf("   %s[%2d]%s %s", Cyan, idx+1, Reset, titleDisp)
+				}
+
+				statusBadge := ""
+				switch {
+				case isMeta:
+					statusBadge = fmt.Sprintf("%s◐ METADATA%s", Magenta, Reset)
+				case t.Status == "active":
+					statusBadge = fmt.Sprintf("%s● DOWNLOADING (%s)%s", Green, formatSpeed(spd), Reset)
+				case t.Status == "paused":
+					statusBadge = fmt.Sprintf("%s❚❚ PAUSED%s", Yellow, Reset)
+				case t.Status == "complete":
+					statusBadge = fmt.Sprintf("%s✔ COMPLETED%s", Cyan, Reset)
+				default:
+					statusBadge = fmt.Sprintf("%s● %s%s", Yellow, strings.ToUpper(t.Status), Reset)
+				}
+
+				barW := cols - 35
+				if barW < 10 {
+					barW = 10
+				}
+				if barW > 25 {
+					barW = 25
+				}
+				filled := int(float64(barW) * pct / 100.0)
+				if filled > barW {
+					filled = barW
+				}
+				empty := barW - filled
+				if empty < 0 {
+					empty = 0
+				}
+				fillStr := fmt.Sprintf("%s%s%s%s", Bold, Cyan, strings.Repeat("█", filled), Reset)
+				emptyStr := fmt.Sprintf("%s%s%s", Dim, strings.Repeat("░", empty), Reset)
+				barDisp := fmt.Sprintf("[%s%s] %5.1f%%", fillStr, emptyStr, pct)
+
+				line2 := fmt.Sprintf("       %s  %s", barDisp, statusBadge)
+
+				line3 := fmt.Sprintf("       %sData:%s %s/%s  %sPeers:%s %d (%d seeds)  %sETA:%s %s",
+					Bold, Reset, formatBytes(done), formatBytes(tot),
+					Bold, Reset, conns, seeders,
+					Bold, Reset, formatTime(etaSec))
+
+				frame = append(frame, "\r"+line1+ClearLine)
+				frame = append(frame, "\r"+line2+ClearLine)
+				frame = append(frame, "\r"+line3+ClearLine)
+				frame = append(frame, "\r"+ClearLine)
+			}
+		}
+
+		for len(frame) < lines-2 {
+			frame = append(frame, "\r"+ClearLine)
+		}
+
+		if statusMsg != "" {
+			frame = append(frame, "\r"+fmt.Sprintf("%s✔ %s%s", Green, statusMsg, Reset)+ClearLine)
+			statusMsg = ""
+		} else {
+			frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+		}
+
+		var footer string
+		if totalItems > 0 {
+			footer = fmt.Sprintf("%s[▲/▼]%s Move  %s[Enter]%s Dashboard  %s[p]%s Pause/Resume  %s[c]%s Cancel  %s[q]%s Return",
+				Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
+		} else {
+			footer = fmt.Sprintf("%s[q/Esc/Enter]%s Return to Terminal", Bold, Reset)
+		}
+		frame = append(frame, "\r"+footer+ClearLine)
+
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
+
+		if hasKeyInput(fd, 500*time.Millisecond) {
+			k := readKey(fd)
+			switch strings.ToLower(k) {
+			case "q", "quit", "esc":
+				return
+			case "up", "k":
+				if selectedIdx > 0 {
+					selectedIdx--
+				}
+			case "down", "j":
+				if selectedIdx < totalItems-1 {
+					selectedIdx++
+				}
+			case "home":
+				selectedIdx = 0
+			case "end":
+				if totalItems > 0 {
+					selectedIdx = totalItems - 1
+				}
+			case "p", "space":
+				if totalItems > 0 {
+					t := activeTasks[selectedIdx]
+					if t.Status == "paused" {
+						unpauseDownload(t.GID)
+						statusMsg = "Download resumed!"
+					} else {
+						pauseDownload(t.GID)
+						statusMsg = "Download paused!"
+					}
+				}
+			case "c", "x":
+				if totalItems > 0 {
+					t := activeTasks[selectedIdx]
+					removeDownload(t.GID)
+					_, _ = ariaRPC("aria2.purgeDownloadResult", nil)
+					statusMsg = "Download cancelled!"
+					if selectedIdx >= totalItems-1 && selectedIdx > 0 {
+						selectedIdx--
+					}
+				}
+			case "enter", "a":
+				if totalItems > 0 {
+					t := activeTasks[selectedIdx]
+					tName := getTaskDisplayName(t)
+					runDownloadLoop(t.GID, tName, "Queue", destDir, fd)
+					fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
+				} else {
+					return
 				}
 			}
-		}
-	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].mtime.After(files[j].mtime)
-	})
-
-	fmt.Printf("%s%s📋 TORQ DOWNLOAD QUEUE & MEDIA REPOSITORY%s\n", Bold, Cyan, Reset)
-	fmt.Printf("Location: %s%s%s\n", Yellow, destDir, Reset)
-	fmt.Printf("%s%s%s\n\n", Dim, strings.Repeat("━", 65), Reset)
-
-	if len(activeTasks) > 0 {
-		fmt.Printf("%s%s⚡ ACTIVE DOWNLOADS%s\n", Bold, Green, Reset)
-		for idx, t := range activeTasks {
-			tName := "BitTorrent Task"
-			if t.Bittorrent != nil && t.Bittorrent.Info != nil && t.Bittorrent.Info.Name != "" {
-				tName = t.Bittorrent.Info.Name
-			} else if len(t.Files) > 0 && t.Files[0].Path != "" {
-				tName = filepath.Base(t.Files[0].Path)
-			}
-			if len(tName) > 42 {
-				tName = tName[:42]
-			}
-			tot, _ := strconv.ParseInt(t.TotalLength, 10, 64)
-			done, _ := strconv.ParseInt(t.CompletedLength, 10, 64)
-			spd, _ := strconv.ParseInt(t.DownloadSpeed, 10, 64)
-			pct := 0.0
-			if tot > 0 {
-				pct = (float64(done) / float64(tot)) * 100.0
-			}
-			fmt.Printf(" [A%d] %s%-42s%s  %s%s%s  %s%4.1f%%%s  %s%s%s\n",
-				idx+1, White, tName, Reset,
-				Green, formatSpeed(spd), Reset,
-				Cyan, pct, Reset,
-				Yellow, t.Status, Reset)
-		}
-		fmt.Printf("\n")
-	}
-
-	fmt.Printf("%s%s📁 COMPLETED MEDIA (%s)%s\n", Bold, Yellow, destDir, Reset)
-	if len(files) == 0 {
-		fmt.Printf(" %sNo downloaded media files found in destination folder.%s\n\n", Dim, Reset)
-	} else {
-		limit := len(files)
-		if limit > 12 {
-			limit = 12
-		}
-		for idx := 0; idx < limit; idx++ {
-			f := files[idx]
-			dispName := f.name
-			if len(dispName) > 48 {
-				dispName = dispName[:48]
-			}
-			fmt.Printf(" %s%s[%2d]%s %s%-48s%s %s%s%s\n", Bold, Cyan, idx+1, Reset, White, dispName, Reset, Yellow, formatBytes(f.size), Reset)
-		}
-		fmt.Println()
-	}
-
-	fmt.Printf("%s%s%s\n", Dim, strings.Repeat("━", 65), Reset)
-	maxNum := len(files)
-	if maxNum > 12 {
-		maxNum = 12
-	}
-	if len(activeTasks) > 0 {
-		fmt.Printf("%s[c]%s Cancel All  %s[p]%s Pause All  %s[r]%s Resume All\n", Bold, Reset, Bold, Reset, Bold, Reset)
-	}
-	fmt.Printf("%s[1-%d]%s Open File  %s[o]%s Open Folder  %s[q]%s Return\n\n", Bold, maxNum, Reset, Bold, Reset, Bold, Reset)
-
-	fmt.Printf("%sAction > %s", Bold, Reset)
-	reader := bufio.NewReader(os.Stdin)
-	choice, _ := reader.ReadString('\n')
-	choice = strings.TrimSpace(strings.ToLower(choice))
-
-	switch {
-	case choice == "q":
-		return
-	case choice == "o":
-		openPath(destDir)
-	case choice == "c" || choice == "cancel" || choice == "ca" || choice == "cancel all":
-		cancelDownloads("all")
-	case choice == "p" || choice == "pause" || choice == "pa" || choice == "pause all":
-		pauseDownloads("all")
-	case choice == "r" || choice == "resume" || choice == "ra" || choice == "resume all":
-		resumeDownloads("all")
-	case strings.HasPrefix(choice, "c"):
-		cancelDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "c")))
-	case strings.HasPrefix(choice, "p"):
-		pauseDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "p")))
-	case strings.HasPrefix(choice, "r"):
-		resumeDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "r")))
-	default:
-		if num, err := strconv.Atoi(choice); err == nil && num >= 1 && num <= len(files) {
-			chosenFile := filepath.Join(destDir, files[num-1].name)
-			openPath(chosenFile)
 		}
 	}
 }

@@ -50,10 +50,11 @@ func init() {
 }
 
 const (
-	Version    = "1.2.0"
-	RPCPort    = 6800
-	RPCSecret  = "torq_secret_session"
-	StreamPort = 3030
+	Version           = "1.2.0"
+	RPCPort           = 6800
+	RPCSecret         = "torq_secret_session"
+	StreamPort        = 3030
+	StreamGatewayPort = 8888
 )
 
 // ANSI Styling
@@ -1101,6 +1102,12 @@ type RqbitStreamStats struct {
 	} `json:"live"`
 }
 
+type StreamVideoFile struct {
+	Index  int
+	Name   string
+	Length int64
+}
+
 func getOutboundIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
@@ -1119,12 +1126,40 @@ func getTerminalSize(fd int) (int, int) {
 	return cols, lines
 }
 
+func cleanURLFileName(name string) string {
+	ext := filepath.Ext(name)
+	base := strings.TrimSuffix(filepath.Base(name), ext)
+	reg := regexp.MustCompile(`[^a-zA-Z0-9_\-\.]+`)
+	safeBase := reg.ReplaceAllString(base, "_")
+	safeBase = strings.Trim(safeBase, "_")
+	if safeBase == "" {
+		safeBase = "stream"
+	}
+	if ext == "" {
+		ext = ".mp4"
+	}
+	return safeBase + ext
+}
+
+func detectCodec(title string) string {
+	low := strings.ToLower(title)
+	if strings.Contains(low, "av1") {
+		return "AV1"
+	}
+	if strings.Contains(low, "hevc") || strings.Contains(low, "x265") || strings.Contains(low, "h265") || strings.Contains(low, "h.265") {
+		return "HEVC (x265)"
+	}
+	if strings.Contains(low, "x264") || strings.Contains(low, "h264") || strings.Contains(low, "h.264") || strings.Contains(low, "avc") {
+		return "AVC (x264)"
+	}
+	return "Standard"
+}
+
 func startRqbitServer(cacheDir string) (*exec.Cmd, error) {
 	if _, err := exec.LookPath("rqbit"); err != nil {
 		return nil, fmt.Errorf("'rqbit' streaming engine is not installed. Run: pkg install rqbit")
 	}
 
-	// Terminate any stale rqbit processes to guarantee fresh port binding and clean state
 	_ = exec.Command("pkill", "-9", "rqbit").Run()
 	time.Sleep(150 * time.Millisecond)
 
@@ -1157,36 +1192,20 @@ func startRqbitServer(cacheDir string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-func findBestStreamFile(files []struct {
-	Name   string `json:"name"`
-	Length int64  `json:"length"`
-}) (int, string, int64) {
-	bestIdx := -1
-	var bestLen int64 = -1
-	bestName := ""
-
-	for idx, f := range files {
-		ext := strings.ToLower(filepath.Ext(f.Name))
-		if videoExts[ext] {
-			if f.Length > bestLen {
-				bestLen = f.Length
-				bestIdx = idx
-				bestName = f.Name
-			}
-		}
+func pauseRqbitTorrent(torrentID int) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/pause", StreamPort, torrentID), nil)
+	if resp, err := client.Do(req); err == nil && resp != nil {
+		_ = resp.Body.Close()
 	}
+}
 
-	if bestIdx == -1 {
-		for idx, f := range files {
-			if f.Length > bestLen {
-				bestLen = f.Length
-				bestIdx = idx
-				bestName = f.Name
-			}
-		}
+func resumeRqbitTorrent(torrentID int) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/start", StreamPort, torrentID), nil)
+	if resp, err := client.Do(req); err == nil && resp != nil {
+		_ = resp.Body.Close()
 	}
-
-	return bestIdx, bestName, bestLen
 }
 
 func setRqbitOnlyFile(torrentID, fileIdx int) {
@@ -1213,21 +1232,153 @@ func deleteRqbitTorrent(torrentID int) {
 	}
 }
 
+func startStreamGateway(torrentID, fileIdx int, cleanFileName string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream/"+cleanFileName, func(w http.ResponseWriter, r *http.Request) {
+		backendURL := fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/stream/%d", StreamPort, torrentID, fileIdx)
+		req, err := http.NewRequestWithContext(r.Context(), r.Method, backendURL, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for k, v := range r.Header {
+			req.Header[k] = v
+		}
+
+		client := &http.Client{Timeout: 0}
+		resp, err := client.Do(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		ext := strings.ToLower(filepath.Ext(cleanFileName))
+		switch ext {
+		case ".mp4":
+			w.Header().Set("Content-Type", "video/mp4")
+		case ".mkv":
+			w.Header().Set("Content-Type", "video/x-matroska")
+		case ".webm":
+			w.Header().Set("Content-Type", "video/webm")
+		default:
+			w.Header().Set("Content-Type", "video/mp4")
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", cleanFileName))
+
+		for k, v := range resp.Header {
+			if strings.EqualFold(k, "Content-Type") {
+				continue
+			}
+			w.Header()[k] = v
+		}
+
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	})
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf("0.0.0.0:%d", StreamGatewayPort),
+		Handler: mux,
+	}
+
+	go func() {
+		_ = server.ListenAndServe()
+	}()
+
+	return server
+}
+
 func openVideoPlayer(streamURL string) {
-	// 1. Try termux-open-url (dispatches to default video player / Rex Player)
 	if _, err := exec.LookPath("termux-open-url"); err == nil {
 		_ = exec.Command("termux-open-url", streamURL).Start()
 		return
 	}
-	// 2. Try Android am start
 	if _, err := exec.LookPath("am"); err == nil {
 		_ = exec.Command("am", "start", "-a", "android.intent.action.VIEW", "-d", streamURL, "-t", "video/*").Start()
 		return
 	}
-	// 3. Fallback to desktop Linux xdg-open
 	if _, err := exec.LookPath("xdg-open"); err == nil {
 		_ = exec.Command("xdg-open", streamURL).Start()
 		return
+	}
+}
+
+func selectEpisodeInteractive(videoFiles []StreamVideoFile, fd int) (StreamVideoFile, bool) {
+	if len(videoFiles) == 1 {
+		return videoFiles[0], true
+	}
+
+	selectedIdx := 0
+	for {
+		cols, lines := getTerminalSize(fd)
+		divLen := cols - 4
+		if divLen < 40 {
+			divLen = 40
+		}
+
+		var frame []string
+		frame = append(frame, fmt.Sprintf("%s%s⚡ TORQ STREAM | SELECT EPISODE / FILE%s", Bold, Cyan, Reset))
+		frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset)
+		frame = append(frame, fmt.Sprintf(" %sMulti-file release (%d videos). Choose which to stream:%s", Bold, len(videoFiles), Reset))
+		frame = append(frame, "")
+
+		maxShow := lines - 8
+		if maxShow < 4 {
+			maxShow = 4
+		}
+		if maxShow > len(videoFiles) {
+			maxShow = len(videoFiles)
+		}
+
+		startIdx := 0
+		if selectedIdx >= maxShow {
+			startIdx = selectedIdx - maxShow + 1
+		}
+		endIdx := startIdx + maxShow
+		if endIdx > len(videoFiles) {
+			endIdx = len(videoFiles)
+		}
+
+		for i := startIdx; i < endIdx; i++ {
+			f := videoFiles[i]
+			fName := f.Name
+			if len(fName) > cols-20 {
+				fName = fName[:cols-23] + "..."
+			}
+			if i == selectedIdx {
+				frame = append(frame, fmt.Sprintf(" %s%s➔ [%2d] %s (%s)%s", Bold, Cyan, i+1, fName, formatBytes(f.Length), Reset))
+			} else {
+				frame = append(frame, fmt.Sprintf("    [%2d] %s %s(%s)%s", i+1, fName, Dim, formatBytes(f.Length), Reset))
+			}
+		}
+
+		for len(frame) < lines-3 {
+			frame = append(frame, "")
+		}
+
+		frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset)
+		frame = append(frame, fmt.Sprintf("%s[▲/▼]%s Navigate  %s[Enter]%s Stream File  %s[q]%s Cancel", Bold, Reset, Bold, Reset, Bold, Reset))
+
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
+
+		k := readKey(fd)
+		switch strings.ToLower(k) {
+		case "up", "k":
+			if selectedIdx > 0 {
+				selectedIdx--
+			}
+		case "down", "j":
+			if selectedIdx < len(videoFiles)-1 {
+				selectedIdx++
+			}
+		case "enter", "space":
+			return videoFiles[selectedIdx], true
+		case "q", "quit", "esc":
+			return StreamVideoFile{}, false
+		}
 	}
 }
 
@@ -1266,86 +1417,228 @@ func addRqbitTorrent(magnetURI, cacheDir string, fd int) (int, int, string, int6
 	_ = json.Unmarshal(bodyBytes, &addResp)
 
 	torrentID := addResp.ID
+
+	// CRITICAL: Immediately pause the torrent to prevent downloading unwanted files/episodes!
+	pauseRqbitTorrent(torrentID)
+
 	files := addResp.Details.Files
 	if len(files) == 0 {
 		files = addResp.Files
 	}
 
-	if len(files) > 0 {
-		bestIdx, bestName, bestLen := findBestStreamFile(files)
-		setRqbitOnlyFile(torrentID, bestIdx)
-		return torrentID, bestIdx, bestName, bestLen, nil
-	}
-
-	// Poll until metadata resolves
-	spinChars := []string{"◐", "◓", "◑", "◒"}
-	spinIdx := 0
-	pollClient := &http.Client{Timeout: 3 * time.Second}
-
-	for start := time.Now(); time.Since(start) < 45*time.Second; {
-		if hasKeyInput(fd, 400*time.Millisecond) {
-			k := readKey(fd)
-			if strings.ToLower(k) == "q" || k == "ESC" || k == "QUIT" {
-				return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
+	var candidateFiles []StreamVideoFile
+	extractCandidates := func(fList []struct {
+		Name   string `json:"name"`
+		Length int64  `json:"length"`
+	}) []StreamVideoFile {
+		var list []StreamVideoFile
+		for idx, f := range fList {
+			ext := strings.ToLower(filepath.Ext(f.Name))
+			if videoExts[ext] {
+				list = append(list, StreamVideoFile{Index: idx, Name: f.Name, Length: f.Length})
 			}
 		}
+		if len(list) == 0 {
+			for idx, f := range fList {
+				list = append(list, StreamVideoFile{Index: idx, Name: f.Name, Length: f.Length})
+			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].Name < list[j].Name
+		})
+		return list
+	}
+
+	if len(files) > 0 {
+		candidateFiles = extractCandidates(files)
+	}
+
+	if len(candidateFiles) == 0 {
+		spinChars := []string{"◐", "◓", "◑", "◒"}
+		spinIdx := 0
+		pollClient := &http.Client{Timeout: 3 * time.Second}
+
+		for start := time.Now(); time.Since(start) < 45*time.Second; {
+			if hasKeyInput(fd, 400*time.Millisecond) {
+				k := readKey(fd)
+				if strings.ToLower(k) == "q" || k == "ESC" || k == "QUIT" {
+					return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
+				}
+			}
+			spinIdx = (spinIdx + 1) % len(spinChars)
+
+			cols, lines := getTerminalSize(fd)
+			divLen := cols - 4
+			if divLen < 40 {
+				divLen = 40
+			}
+			var frame []string
+			frame = append(frame, fmt.Sprintf("%s%s⚡ TORQ STREAM%s | %s%sZERO-DISK & BANDWIDTH ISOLATION%s", Bold, Cyan, Reset, Bold, Green, Reset))
+			frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset)
+			frame = append(frame, "")
+			frame = append(frame, fmt.Sprintf(" %s%s Resolving torrent metadata & video tracks...%s", Cyan, spinChars[spinIdx], Reset))
+			frame = append(frame, fmt.Sprintf(" %sBandwidth Saver: Downloads are paused until video file is confirmed.%s", Dim, Reset))
+			frame = append(frame, "")
+			frame = append(frame, fmt.Sprintf(" %s🔒 Zero-Disk Cache: No file will be saved permanently to device.%s", Yellow, Reset))
+			frame = append(frame, "")
+			frame = append(frame, fmt.Sprintf(" %s[q]%s Cancel", Bold, Reset))
+
+			for len(frame) < lines-2 {
+				frame = append(frame, "")
+			}
+
+			fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
+
+			getResp, err := pollClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents/%d", StreamPort, torrentID))
+			if err == nil && getResp.StatusCode == 200 {
+				var detailResp struct {
+					Files []struct {
+						Name   string `json:"name"`
+						Length int64  `json:"length"`
+					} `json:"files"`
+					Details struct {
+						Files []struct {
+							Name   string `json:"name"`
+							Length int64  `json:"length"`
+						} `json:"files"`
+					} `json:"details"`
+				}
+				_ = json.NewDecoder(getResp.Body).Decode(&detailResp)
+				getResp.Body.Close()
+
+				fList := detailResp.Files
+				if len(fList) == 0 {
+					fList = detailResp.Details.Files
+				}
+
+				if len(fList) > 0 {
+					candidateFiles = extractCandidates(fList)
+					break
+				}
+			} else if getResp != nil {
+				getResp.Body.Close()
+			}
+		}
+	}
+
+	if len(candidateFiles) == 0 {
+		return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out")
+	}
+
+	var chosen StreamVideoFile
+	if len(candidateFiles) == 1 {
+		chosen = candidateFiles[0]
+	} else {
+		picked, ok := selectEpisodeInteractive(candidateFiles, fd)
+		if !ok {
+			return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
+		}
+		chosen = picked
+	}
+
+	setRqbitOnlyFile(torrentID, chosen.Index)
+	resumeRqbitTorrent(torrentID)
+
+	return torrentID, chosen.Index, chosen.Name, chosen.Length, nil
+}
+
+func preBufferStream(torrentID int, fileSize int64, title, fileName, cleanName, streamURL string, fd int) bool {
+	minBuffer := int64(25 * 1024 * 1024) // 25 MB
+	if fileSize > 0 && fileSize < 100*1024*1024 {
+		minBuffer = fileSize * 15 / 100
+	} else if fileSize > 0 && minBuffer > fileSize/2 {
+		minBuffer = fileSize / 2
+	}
+
+	statsClient := &http.Client{Timeout: 2 * time.Second}
+	spinChars := []string{"◐", "◓", "◑", "◒"}
+	spinIdx := 0
+
+	for {
+		if hasKeyInput(fd, 300*time.Millisecond) {
+			k := readKey(fd)
+			switch strings.ToLower(k) {
+			case "q", "esc", "quit":
+				return false
+			case "p", "enter", "o":
+				return true
+			}
+		}
+
 		spinIdx = (spinIdx + 1) % len(spinChars)
+
+		resp, err := statsClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/stats/v1", StreamPort, torrentID))
+		var stats RqbitStreamStats
+		if err == nil && resp.StatusCode == 200 {
+			_ = json.NewDecoder(resp.Body).Decode(&stats)
+			resp.Body.Close()
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+
+		var buffered int64 = 0
+		speedDown := "0.00 MiB/s"
+		livePeers := 0
+		if stats.Live != nil {
+			buffered = stats.Live.Snapshot.DownloadedBytes
+			speedDown = stats.Live.DownloadSpeed.HumanReadable
+			livePeers = stats.Live.Snapshot.PeerStats.Live
+		}
+		if buffered == 0 && stats.ProgressBytes > 0 {
+			buffered = stats.ProgressBytes
+		}
+
+		if buffered >= minBuffer {
+			return true
+		}
+
+		pct := float64(buffered) / float64(minBuffer) * 100.0
+		if pct > 100 {
+			pct = 100
+		}
 
 		cols, lines := getTerminalSize(fd)
 		divLen := cols - 4
 		if divLen < 40 {
 			divLen = 40
 		}
+
+		barWidth := cols - 32
+		if barWidth < 12 {
+			barWidth = 12
+		}
+		if barWidth > 35 {
+			barWidth = 35
+		}
+		filled := int(float64(barWidth) * pct / 100.0)
+		empty := barWidth - filled
+
 		var frame []string
-		frame = append(frame, fmt.Sprintf("%s%s⚡ TORQ STREAM%s | %s%sZERO-DISK EPHEMERAL MODE%s", Bold, Cyan, Reset, Bold, Green, Reset))
+		frame = append(frame, fmt.Sprintf("%s%s⚡ TORQ STREAM | STALL-FREE PRE-BUFFER%s", Bold, Cyan, Reset))
 		frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset)
 		frame = append(frame, "")
-		frame = append(frame, fmt.Sprintf(" %s%s Connecting to swarm & resolving video stream metadata...%s", Cyan, spinChars[spinIdx], Reset))
-		frame = append(frame, fmt.Sprintf(" %sLocating video container for Rex Player / video streaming...%s", Dim, Reset))
+		frame = append(frame, fmt.Sprintf(" %sPre-buffering initial window for stall-free playback...%s", Bold, Reset))
+		dispFile := fileName
+		if len(dispFile) > cols-12 {
+			dispFile = dispFile[:cols-15] + "..."
+		}
+		frame = append(frame, fmt.Sprintf(" File: %s%s%s", Yellow, dispFile, Reset))
 		frame = append(frame, "")
-		frame = append(frame, fmt.Sprintf(" %s🔒 Zero-Disk Cache: No file will be saved permanently to device.%s", Yellow, Reset))
+
+		fillStr := fmt.Sprintf("%s%s%s%s", Bold, Green, strings.Repeat("█", filled), Reset)
+		emptyStr := fmt.Sprintf("%s%s%s", Dim, strings.Repeat("░", empty), Reset)
+		frame = append(frame, fmt.Sprintf(" Buffer: [%s%s] %s%5.1f%%%s (%s / %s)", fillStr, emptyStr, Bold, pct, Reset, formatBytes(buffered), formatBytes(minBuffer)))
+		frame = append(frame, fmt.Sprintf(" Rate:   %s▼ %s%s  |  Swarm: %s%d peers%s", Green, speedDown, Reset, Yellow, livePeers, Reset))
 		frame = append(frame, "")
-		frame = append(frame, fmt.Sprintf(" %s[q]%s Cancel", Bold, Reset))
+		frame = append(frame, fmt.Sprintf(" %sℹ Rex Player will auto-open once buffer reaches 100%%%s", Dim, Reset))
+		frame = append(frame, fmt.Sprintf(" %s[Enter / p]%s Force-play now   %s[q]%s Cancel", Bold, Reset, Bold, Reset))
 
 		for len(frame) < lines-2 {
 			frame = append(frame, "")
 		}
 
 		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
-
-		getResp, err := pollClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents/%d", StreamPort, torrentID))
-		if err == nil && getResp.StatusCode == 200 {
-			var detailResp struct {
-				Files []struct {
-					Name   string `json:"name"`
-					Length int64  `json:"length"`
-				} `json:"files"`
-				Details struct {
-					Files []struct {
-						Name   string `json:"name"`
-						Length int64  `json:"length"`
-					} `json:"files"`
-				} `json:"details"`
-			}
-			_ = json.NewDecoder(getResp.Body).Decode(&detailResp)
-			getResp.Body.Close()
-
-			fList := detailResp.Files
-			if len(fList) == 0 {
-				fList = detailResp.Details.Files
-			}
-
-			if len(fList) > 0 {
-				bestIdx, bestName, bestLen := findBestStreamFile(fList)
-				setRqbitOnlyFile(torrentID, bestIdx)
-				return torrentID, bestIdx, bestName, bestLen, nil
-			}
-		} else if getResp != nil {
-			getResp.Body.Close()
-		}
 	}
-
-	return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out")
 }
 
 func streamDashboard(item TorrentItem) {
@@ -1366,7 +1659,6 @@ func streamDashboard(item TorrentItem) {
 	fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
 	defer fmt.Print("\033[?25h\033[?1049l\r\n")
 
-	// Create ephemeral cache directory: ZERO DISK PERSISTENCE GUARANTEE
 	cacheDir, err := os.MkdirTemp("", "torq-stream-*")
 	if err != nil {
 		cacheDir = filepath.Join(os.TempDir(), fmt.Sprintf("torq-stream-%d", time.Now().UnixNano()))
@@ -1402,20 +1694,32 @@ func streamDashboard(item TorrentItem) {
 		deleteRqbitTorrent(torrentID)
 	}()
 
-	streamURL := fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/stream/%d", StreamPort, torrentID, bestFileIdx)
+	cleanName := cleanURLFileName(fileName)
+	gateway := startStreamGateway(torrentID, bestFileIdx, cleanName)
+	defer func() {
+		_ = gateway.Close()
+	}()
+
+	streamURL := fmt.Sprintf("http://127.0.0.1:%d/stream/%s", StreamGatewayPort, cleanName)
 	lanIP := getOutboundIP()
 	lanURL := ""
 	if lanIP != "" {
-		lanURL = fmt.Sprintf("http://%s:%d/torrents/%d/stream/%d", lanIP, StreamPort, torrentID, bestFileIdx)
+		lanURL = fmt.Sprintf("http://%s:%d/stream/%s", lanIP, StreamGatewayPort, cleanName)
 	}
 
 	_ = copyToClipboard(streamURL)
+
+	if ok := preBufferStream(torrentID, fileSize, item.Title, fileName, cleanName, streamURL, fd); !ok {
+		return
+	}
+
 	openVideoPlayer(streamURL)
 
-	runStreamLoop(torrentID, item.Title, fileName, fileSize, streamURL, lanURL, cacheDir, fd)
+	codec := detectCodec(item.Title + " " + fileName)
+	runStreamLoop(torrentID, item.Title, fileName, cleanName, codec, fileSize, streamURL, lanURL, cacheDir, fd)
 }
 
-func runStreamLoop(torrentID int, title, fileName string, fileSize int64, streamURL, lanURL, cacheDir string, fd int) {
+func runStreamLoop(torrentID int, title, fileName, cleanName, codec string, fileSize int64, streamURL, lanURL, cacheDir string, fd int) {
 	statusMsg := "Player intent launched! Tap play in Rex Player."
 	statsClient := &http.Client{Timeout: 2 * time.Second}
 
@@ -1478,7 +1782,7 @@ func runStreamLoop(torrentID int, title, fileName string, fileSize int64, stream
 		empty := barWidth - filled
 
 		var frame []string
-		hdr := fmt.Sprintf("%s%s⚡ TORQ STREAM ENGINE%s | %s%sZERO-DISK EPHEMERAL MODE%s", Bold, Cyan, Reset, Bold, Green, Reset)
+		hdr := fmt.Sprintf("%s%s⚡ TORQ STREAM ENGINE%s | %s%sZERO-DISK MODE%s", Bold, Cyan, Reset, Bold, Green, Reset)
 		frame = append(frame, "\r"+hdr+ClearLine)
 		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 
@@ -1493,6 +1797,7 @@ func runStreamLoop(torrentID int, title, fileName string, fileSize int64, stream
 
 		frame = append(frame, "\r"+fmt.Sprintf(" %sTitle:%s  %s%s%s", Bold, Reset, Bold, dispTitle, Reset)+ClearLine)
 		frame = append(frame, "\r"+fmt.Sprintf(" %sFile:%s   %s%s%s (%s)", Bold, Reset, Yellow, dispFile, Reset, formatBytes(fileSize))+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sCodec:%s  %s%s%s", Bold, Reset, Cyan, codec, Reset)+ClearLine)
 		frame = append(frame, "\r"+fmt.Sprintf(" %sStatus:%s %s▶ STREAMING LIVE TO PLAYER%s", Bold, Reset, Green, Reset)+ClearLine)
 		frame = append(frame, "\r"+ClearLine)
 
@@ -1515,9 +1820,12 @@ func runStreamLoop(torrentID int, title, fileName string, fileSize int64, stream
 		frame = append(frame, "\r"+metrics+ClearLine)
 		frame = append(frame, "\r"+ClearLine)
 
+		if codec == "AV1" {
+			frame = append(frame, "\r"+fmt.Sprintf(" %s⚠️ AV1 Notice: If video is blank, your device lacks AV1 HW decode. Try an x264/x265 release.%s", Yellow, Reset)+ClearLine)
+		}
+
 		frame = append(frame, "\r"+fmt.Sprintf(" %s🔒 ZERO-DISK GUARANTEE:%s", Yellow, Reset)+ClearLine)
-		frame = append(frame, "\r"+fmt.Sprintf(" %sEphemeral cache active. No file is saved to Downloads.%s", Dim, Reset)+ClearLine)
-		frame = append(frame, "\r"+fmt.Sprintf(" %sAll buffered chunks are immediately purged upon exit.%s", Dim, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sEphemeral cache active. No file is saved to Downloads. Purged on exit.%s", Dim, Reset)+ClearLine)
 
 		for len(frame) < lines-3 {
 			frame = append(frame, "\r"+ClearLine)

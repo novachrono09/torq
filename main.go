@@ -1435,11 +1435,14 @@ func addRqbitTorrent(magnetURI, title string, fd int) (int, int, string, int64, 
 		err error
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
 	postChan := make(chan addPostResult, 1)
 	go func() {
-		client := &http.Client{Timeout: 15 * time.Second}
+		client := &http.Client{Timeout: 90 * time.Second}
 		addURL := fmt.Sprintf("http://127.0.0.1:%d/torrents", StreamPort)
-		req, err := http.NewRequest("POST", addURL, strings.NewReader(magnetURI))
+		req, err := http.NewRequestWithContext(ctx, "POST", addURL, strings.NewReader(magnetURI))
 		if err != nil {
 			postChan <- addPostResult{err: err}
 			return
@@ -1487,24 +1490,74 @@ func addRqbitTorrent(magnetURI, title string, fd int) (int, int, string, int64, 
 		Length int64  `json:"length"`
 	}
 
+	startTime := time.Now()
+	pollClient := &http.Client{Timeout: 1 * time.Second}
+	lastPoll := time.Time{}
+
 	for {
 		select {
 		case res := <-postChan:
 			if res.err != nil {
-				return 0, 0, "", 0, fmt.Errorf("failed connecting to stream engine: %w", res.err)
+				if ctx.Err() == context.Canceled {
+					return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
+				}
+				return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out: %w", res.err)
 			}
 			torrentID = res.torrentID
 			initialFiles = res.files
 			goto MetadataLoop
+
 		default:
 			if hasKeyInput(fd, 100*time.Millisecond) {
 				k := readKey(fd)
 				if strings.ToLower(k) == "q" || k == "ESC" || k == "QUIT" {
+					cancel()
 					return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
 				}
 			}
+
+			// Concurrently check if rqbit has already registered the torrent
+			if time.Since(lastPoll) >= 500*time.Millisecond {
+				lastPoll = time.Now()
+				listResp, err := pollClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents", StreamPort))
+				if err == nil && listResp.StatusCode == 200 {
+					var torrentsData struct {
+						Torrents []struct {
+							ID    int    `json:"id"`
+							Name  string `json:"name"`
+							Files []struct {
+								Name   string `json:"name"`
+								Length int64  `json:"length"`
+							} `json:"files"`
+						} `json:"torrents"`
+					}
+					if err := json.NewDecoder(listResp.Body).Decode(&torrentsData); err == nil {
+						listResp.Body.Close()
+						if len(torrentsData.Torrents) > 0 {
+							t := torrentsData.Torrents[0]
+							torrentID = t.ID
+							pauseRqbitTorrent(torrentID)
+							initialFiles = t.Files
+							cancel()
+							goto MetadataLoop
+						}
+					} else {
+						listResp.Body.Close()
+					}
+				} else if listResp != nil {
+					listResp.Body.Close()
+				}
+			}
+
+			elapsed := int(time.Since(startTime).Seconds())
+			if elapsed >= 90 {
+				cancel()
+				return 0, 0, "", 0, fmt.Errorf("swarm metadata resolution timed out (90s)")
+			}
+
 			spinIdx++
-			drawConnectingFrame(fd, title, "Contacting tracker swarm...", spinIdx)
+			msg := fmt.Sprintf("Contacting tracker swarm... (%ds / 90s)", elapsed)
+			drawConnectingFrame(fd, title, msg, spinIdx)
 		}
 	}
 
@@ -1537,16 +1590,19 @@ MetadataLoop:
 	}
 
 	if len(candidateFiles) == 0 {
-		pollClient := &http.Client{Timeout: 3 * time.Second}
-		for start := time.Now(); time.Since(start) < 45*time.Second; {
-			if hasKeyInput(fd, 120*time.Millisecond) {
+		pollClient := &http.Client{Timeout: 2 * time.Second}
+		metaStart := time.Now()
+		for time.Since(metaStart) < 35*time.Second {
+			if hasKeyInput(fd, 150*time.Millisecond) {
 				k := readKey(fd)
 				if strings.ToLower(k) == "q" || k == "ESC" || k == "QUIT" {
+					deleteRqbitTorrent(torrentID)
 					return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
 				}
 			}
 			spinIdx++
-			drawConnectingFrame(fd, title, "Resolving video container & tracks...", spinIdx)
+			elapsedMeta := int(time.Since(metaStart).Seconds())
+			drawConnectingFrame(fd, title, fmt.Sprintf("Resolving video container & tracks... (%ds)", elapsedMeta), spinIdx)
 
 			getResp, err := pollClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents/%d", StreamPort, torrentID))
 			if err == nil && getResp.StatusCode == 200 {
@@ -1572,7 +1628,9 @@ MetadataLoop:
 
 				if len(fList) > 0 {
 					candidateFiles = extractCandidates(fList)
-					break
+					if len(candidateFiles) > 0 {
+						break
+					}
 				}
 			} else if getResp != nil {
 				getResp.Body.Close()
@@ -1581,7 +1639,8 @@ MetadataLoop:
 	}
 
 	if len(candidateFiles) == 0 {
-		return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out")
+		deleteRqbitTorrent(torrentID)
+		return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out (could not read file list)")
 	}
 
 	var chosen StreamVideoFile
@@ -1590,6 +1649,7 @@ MetadataLoop:
 	} else {
 		picked, ok := selectEpisodeInteractive(candidateFiles, fd)
 		if !ok {
+			deleteRqbitTorrent(torrentID)
 			return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
 		}
 		chosen = picked
@@ -1740,17 +1800,41 @@ func streamDashboard(item TorrentItem) {
 		_ = readKey(fd)
 		return
 	}
-	if rqCmd != nil && rqCmd.Process != nil {
-		defer func() {
+	defer func() {
+		if rqCmd != nil && rqCmd.Process != nil {
 			_ = rqCmd.Process.Kill()
 			_ = rqCmd.Wait()
-		}()
-	}
+		}
+		_ = exec.Command("pkill", "-9", "rqbit").Run()
+	}()
 
 	torrentID, bestFileIdx, fileName, fileSize, err := addRqbitTorrent(item.Magnet, item.Title, fd)
 	if err != nil {
-		fmt.Printf("\r\n%s%s✖ %v%s\r\n", Bold, Red, err, Reset)
-		fmt.Printf("\r\n%sPress any key to return...%s", Dim, Reset)
+		if rqCmd != nil && rqCmd.Process != nil {
+			_ = rqCmd.Process.Kill()
+			_ = rqCmd.Wait()
+		}
+		_ = exec.Command("pkill", "-9", "rqbit").Run()
+		_ = os.RemoveAll(cacheDir)
+
+		if strings.Contains(strings.ToLower(err.Error()), "cancelled") {
+			return
+		}
+
+		fmt.Print(ClearScrn + MoveTop)
+		cols, _ := getTerminalSize(fd)
+		divLen := cols - 4
+		if divLen < 40 {
+			divLen = 40
+		}
+		fmt.Printf("\r\n%s%s⚡ TORQ STREAM NOTICE%s\r\n", Bold, Yellow, Reset)
+		fmt.Printf("%s%s%s\r\n", Dim, strings.Repeat("━", divLen), Reset)
+		fmt.Printf(" %s✖ %v%s\r\n\r\n", Red, err, Reset)
+		fmt.Printf(" %s💡 Swarm metadata could not be resolved.%s\r\n", Yellow, Reset)
+		fmt.Printf("   Try choosing a release with more active seeders, or\r\n")
+		fmt.Printf("   use [Enter] to download via aria2c.\r\n\r\n")
+		fmt.Printf("%s%s%s\r\n", Dim, strings.Repeat("━", divLen), Reset)
+		fmt.Printf(" %sPress any key to return to search...%s", Dim, Reset)
 		_ = readKey(fd)
 		return
 	}

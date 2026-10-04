@@ -548,38 +548,53 @@ func checkDiskSpace(destDir string, requiredBytes int64) (bool, int64) {
 }
 
 func copyToClipboard(text string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
 	if _, err := exec.LookPath("termux-clipboard-set"); err == nil {
-		cmd := exec.Command("termux-clipboard-set")
+		cmd := exec.CommandContext(ctx, "termux-clipboard-set")
 		cmd.Stdin = strings.NewReader(text)
-		return cmd.Run() == nil
+		if cmd.Run() == nil {
+			return true
+		}
 	}
 	if _, err := exec.LookPath("wl-copy"); err == nil {
-		cmd := exec.Command("wl-copy")
+		cmd := exec.CommandContext(ctx, "wl-copy")
 		cmd.Stdin = strings.NewReader(text)
-		return cmd.Run() == nil
+		if cmd.Run() == nil {
+			return true
+		}
 	}
 	if _, err := exec.LookPath("xclip"); err == nil {
-		cmd := exec.Command("xclip", "-selection", "clipboard")
+		cmd := exec.CommandContext(ctx, "xclip", "-selection", "clipboard")
 		cmd.Stdin = strings.NewReader(text)
-		return cmd.Run() == nil
+		if cmd.Run() == nil {
+			return true
+		}
 	}
 	if _, err := exec.LookPath("pbcopy"); err == nil {
-		cmd := exec.Command("pbcopy")
+		cmd := exec.CommandContext(ctx, "pbcopy")
 		cmd.Stdin = strings.NewReader(text)
-		return cmd.Run() == nil
+		if cmd.Run() == nil {
+			return true
+		}
 	}
 	return false
 }
 
 func sendNotification(title, message string) {
-	if _, err := exec.LookPath("termux-notification"); err == nil {
-		_ = exec.Command("termux-notification", "--title", title, "--content", message, "--priority", "high").Run()
-		return
-	}
-	if _, err := exec.LookPath("notify-send"); err == nil {
-		_ = exec.Command("notify-send", title, message).Run()
-		return
-	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		if _, err := exec.LookPath("termux-notification"); err == nil {
+			_ = exec.CommandContext(ctx, "termux-notification", "--title", title, "--content", message, "--priority", "high").Run()
+			return
+		}
+		if _, err := exec.LookPath("notify-send"); err == nil {
+			_ = exec.CommandContext(ctx, "notify-send", title, message).Run()
+			return
+		}
+	}()
 }
 
 func openPath(target string) {
@@ -1332,12 +1347,12 @@ func startStreamGateway(torrentID, fileIdx int, cleanFileName string) *http.Serv
 }
 
 func openVideoPlayer(streamURL string) {
-	if _, err := exec.LookPath("termux-open-url"); err == nil {
-		_ = exec.Command("termux-open-url", streamURL).Start()
-		return
-	}
 	if _, err := exec.LookPath("am"); err == nil {
 		_ = exec.Command("am", "start", "-a", "android.intent.action.VIEW", "-d", streamURL, "-t", "video/*").Start()
+		return
+	}
+	if _, err := exec.LookPath("termux-open-url"); err == nil {
+		_ = exec.Command("termux-open-url", streamURL).Start()
 		return
 	}
 	if _, err := exec.LookPath("xdg-open"); err == nil {
@@ -1856,7 +1871,7 @@ func streamDashboard(item TorrentItem) {
 		lanURL = fmt.Sprintf("http://%s:%d/stream/%s", lanIP, StreamGatewayPort, cleanName)
 	}
 
-	_ = copyToClipboard(streamURL)
+	go copyToClipboard(streamURL)
 
 	if ok := preBufferStream(torrentID, fileSize, item.Title, fileName, cleanName, streamURL, fd); !ok {
 		return

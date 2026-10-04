@@ -50,9 +50,10 @@ func init() {
 }
 
 const (
-	Version   = "1.1.0"
-	RPCPort   = 6800
-	RPCSecret = "torq_secret_session"
+	Version    = "1.2.0"
+	RPCPort    = 6800
+	RPCSecret  = "torq_secret_session"
+	StreamPort = 3030
 )
 
 // ANSI Styling
@@ -1066,6 +1067,538 @@ func downloadDashboard(item TorrentItem, destDir string) {
 	runDownloadLoop(activeGID, item.Title, item.Source, destDir, fd)
 }
 
+var videoExts = map[string]bool{
+	".mp4":  true,
+	".mkv":  true,
+	".avi":  true,
+	".mov":  true,
+	".wmv":  true,
+	".webm": true,
+	".flv":  true,
+	".m4v":  true,
+	".ts":   true,
+	".m2ts": true,
+}
+
+type RqbitStreamStats struct {
+	State         string `json:"state"`
+	ProgressBytes int64  `json:"progress_bytes"`
+	TotalBytes    int64  `json:"total_bytes"`
+	Live          *struct {
+		Snapshot struct {
+			DownloadedBytes int64 `json:"downloaded_and_checked_bytes"`
+			PeerStats       struct {
+				Live       int `json:"live"`
+				Connecting int `json:"connecting"`
+			} `json:"peer_stats"`
+		} `json:"snapshot"`
+		DownloadSpeed struct {
+			HumanReadable string `json:"human_readable"`
+		} `json:"download_speed"`
+		UploadSpeed struct {
+			HumanReadable string `json:"human_readable"`
+		} `json:"upload_speed"`
+	} `json:"live"`
+}
+
+func getOutboundIP() string {
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP.String()
+}
+
+func getTerminalSize(fd int) (int, int) {
+	cols, lines, err := term.GetSize(fd)
+	if err != nil || cols <= 0 {
+		return 80, 24
+	}
+	return cols, lines
+}
+
+func startRqbitServer(cacheDir string) (*exec.Cmd, error) {
+	if _, err := exec.LookPath("rqbit"); err != nil {
+		return nil, fmt.Errorf("'rqbit' streaming engine is not installed. Run: pkg install rqbit")
+	}
+
+	// Terminate any stale rqbit processes to guarantee fresh port binding and clean state
+	_ = exec.Command("pkill", "-9", "rqbit").Run()
+	time.Sleep(150 * time.Millisecond)
+
+	cmd := exec.Command("rqbit",
+		"--http-api-listen-addr", fmt.Sprintf("0.0.0.0:%d", StreamPort),
+		"server", "start", cacheDir,
+		"--disable-persistence",
+	)
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+
+	client := &http.Client{Timeout: 400 * time.Millisecond}
+	testURL := fmt.Sprintf("http://127.0.0.1:%d/", StreamPort)
+	for i := 0; i < 35; i++ {
+		time.Sleep(100 * time.Millisecond)
+		resp, err := client.Get(testURL)
+		if err == nil && resp.StatusCode == 200 {
+			_ = resp.Body.Close()
+			return cmd, nil
+		}
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+
+	return cmd, nil
+}
+
+func findBestStreamFile(files []struct {
+	Name   string `json:"name"`
+	Length int64  `json:"length"`
+}) (int, string, int64) {
+	bestIdx := -1
+	var bestLen int64 = -1
+	bestName := ""
+
+	for idx, f := range files {
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		if videoExts[ext] {
+			if f.Length > bestLen {
+				bestLen = f.Length
+				bestIdx = idx
+				bestName = f.Name
+			}
+		}
+	}
+
+	if bestIdx == -1 {
+		for idx, f := range files {
+			if f.Length > bestLen {
+				bestLen = f.Length
+				bestIdx = idx
+				bestName = f.Name
+			}
+		}
+	}
+
+	return bestIdx, bestName, bestLen
+}
+
+func setRqbitOnlyFile(torrentID, fileIdx int) {
+	body := fmt.Sprintf(`{"only_files": [%d]}`, fileIdx)
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/update_only_files", StreamPort, torrentID), strings.NewReader(body))
+	if err == nil {
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+}
+
+func deleteRqbitTorrent(torrentID int) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	req, err := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/delete", StreamPort, torrentID), nil)
+	if err == nil {
+		resp, err := client.Do(req)
+		if err == nil && resp != nil {
+			_ = resp.Body.Close()
+		}
+	}
+}
+
+func openVideoPlayer(streamURL string) {
+	// 1. Try termux-open-url (dispatches to default video player / Rex Player)
+	if _, err := exec.LookPath("termux-open-url"); err == nil {
+		_ = exec.Command("termux-open-url", streamURL).Start()
+		return
+	}
+	// 2. Try Android am start
+	if _, err := exec.LookPath("am"); err == nil {
+		_ = exec.Command("am", "start", "-a", "android.intent.action.VIEW", "-d", streamURL, "-t", "video/*").Start()
+		return
+	}
+	// 3. Fallback to desktop Linux xdg-open
+	if _, err := exec.LookPath("xdg-open"); err == nil {
+		_ = exec.Command("xdg-open", streamURL).Start()
+		return
+	}
+}
+
+func addRqbitTorrent(magnetURI, cacheDir string, fd int) (int, int, string, int64, error) {
+	client := &http.Client{Timeout: 10 * time.Second}
+	addURL := fmt.Sprintf("http://127.0.0.1:%d/torrents", StreamPort)
+	req, err := http.NewRequest("POST", addURL, strings.NewReader(magnetURI))
+	if err != nil {
+		return 0, 0, "", 0, err
+	}
+	req.Header.Set("Content-Type", "text/plain")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, "", 0, fmt.Errorf("could not connect to stream daemon: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var addResp struct {
+		ID      int `json:"id"`
+		Details struct {
+			ID    int    `json:"id"`
+			Name  string `json:"name"`
+			Files []struct {
+				Name   string `json:"name"`
+				Length int64  `json:"length"`
+			} `json:"files"`
+		} `json:"details"`
+		Files []struct {
+			Name   string `json:"name"`
+			Length int64  `json:"length"`
+		} `json:"files"`
+	}
+
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	_ = json.Unmarshal(bodyBytes, &addResp)
+
+	torrentID := addResp.ID
+	files := addResp.Details.Files
+	if len(files) == 0 {
+		files = addResp.Files
+	}
+
+	if len(files) > 0 {
+		bestIdx, bestName, bestLen := findBestStreamFile(files)
+		setRqbitOnlyFile(torrentID, bestIdx)
+		return torrentID, bestIdx, bestName, bestLen, nil
+	}
+
+	// Poll until metadata resolves
+	spinChars := []string{"◐", "◓", "◑", "◒"}
+	spinIdx := 0
+	pollClient := &http.Client{Timeout: 3 * time.Second}
+
+	for start := time.Now(); time.Since(start) < 45*time.Second; {
+		if hasKeyInput(fd, 400*time.Millisecond) {
+			k := readKey(fd)
+			if strings.ToLower(k) == "q" || k == "ESC" || k == "QUIT" {
+				return 0, 0, "", 0, fmt.Errorf("stream cancelled by user")
+			}
+		}
+		spinIdx = (spinIdx + 1) % len(spinChars)
+
+		cols, lines := getTerminalSize(fd)
+		divLen := cols - 4
+		if divLen < 40 {
+			divLen = 40
+		}
+		var frame []string
+		frame = append(frame, fmt.Sprintf("%s%s⚡ TORQ STREAM%s | %s%sZERO-DISK EPHEMERAL MODE%s", Bold, Cyan, Reset, Bold, Green, Reset))
+		frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset)
+		frame = append(frame, "")
+		frame = append(frame, fmt.Sprintf(" %s%s Connecting to swarm & resolving video stream metadata...%s", Cyan, spinChars[spinIdx], Reset))
+		frame = append(frame, fmt.Sprintf(" %sLocating video container for Rex Player / video streaming...%s", Dim, Reset))
+		frame = append(frame, "")
+		frame = append(frame, fmt.Sprintf(" %s🔒 Zero-Disk Cache: No file will be saved permanently to device.%s", Yellow, Reset))
+		frame = append(frame, "")
+		frame = append(frame, fmt.Sprintf(" %s[q]%s Cancel", Bold, Reset))
+
+		for len(frame) < lines-2 {
+			frame = append(frame, "")
+		}
+
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
+
+		getResp, err := pollClient.Get(fmt.Sprintf("http://127.0.0.1:%d/torrents/%d", StreamPort, torrentID))
+		if err == nil && getResp.StatusCode == 200 {
+			var detailResp struct {
+				Files []struct {
+					Name   string `json:"name"`
+					Length int64  `json:"length"`
+				} `json:"files"`
+				Details struct {
+					Files []struct {
+						Name   string `json:"name"`
+						Length int64  `json:"length"`
+					} `json:"files"`
+				} `json:"details"`
+			}
+			_ = json.NewDecoder(getResp.Body).Decode(&detailResp)
+			getResp.Body.Close()
+
+			fList := detailResp.Files
+			if len(fList) == 0 {
+				fList = detailResp.Details.Files
+			}
+
+			if len(fList) > 0 {
+				bestIdx, bestName, bestLen := findBestStreamFile(fList)
+				setRqbitOnlyFile(torrentID, bestIdx)
+				return torrentID, bestIdx, bestName, bestLen, nil
+			}
+		} else if getResp != nil {
+			getResp.Body.Close()
+		}
+	}
+
+	return 0, 0, "", 0, fmt.Errorf("swarm metadata timed out")
+}
+
+func streamDashboard(item TorrentItem) {
+	if _, err := exec.LookPath("rqbit"); err != nil {
+		fmt.Printf("\r\n%s[!] 'rqbit' streaming engine is not installed.%s\r\nPlease install it using: pkg install rqbit\r\n", Red, Reset)
+		fmt.Printf("\r\n%sPress any key to return...%s", Dim, Reset)
+		fd := int(os.Stdin.Fd())
+		_ = readKey(fd)
+		return
+	}
+
+	fd := int(os.Stdin.Fd())
+	oldState, err := term.MakeRaw(fd)
+	if err == nil {
+		defer term.Restore(fd, oldState)
+	}
+
+	fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
+	defer fmt.Print("\033[?25h\033[?1049l\r\n")
+
+	// Create ephemeral cache directory: ZERO DISK PERSISTENCE GUARANTEE
+	cacheDir, err := os.MkdirTemp("", "torq-stream-*")
+	if err != nil {
+		cacheDir = filepath.Join(os.TempDir(), fmt.Sprintf("torq-stream-%d", time.Now().UnixNano()))
+		_ = os.MkdirAll(cacheDir, 0700)
+	}
+	defer func() {
+		_ = os.RemoveAll(cacheDir)
+	}()
+
+	rqCmd, err := startRqbitServer(cacheDir)
+	if err != nil {
+		fmt.Printf("\r\n%s%s✖ Failed to start stream engine: %v%s\r\n", Bold, Red, err, Reset)
+		fmt.Printf("\r\n%sPress any key to return...%s", Dim, Reset)
+		_ = readKey(fd)
+		return
+	}
+	if rqCmd != nil && rqCmd.Process != nil {
+		defer func() {
+			_ = rqCmd.Process.Kill()
+			_ = rqCmd.Wait()
+		}()
+	}
+
+	torrentID, bestFileIdx, fileName, fileSize, err := addRqbitTorrent(item.Magnet, cacheDir, fd)
+	if err != nil {
+		fmt.Printf("\r\n%s%s✖ %v%s\r\n", Bold, Red, err, Reset)
+		fmt.Printf("\r\n%sPress any key to return...%s", Dim, Reset)
+		_ = readKey(fd)
+		return
+	}
+
+	defer func() {
+		deleteRqbitTorrent(torrentID)
+	}()
+
+	streamURL := fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/stream/%d", StreamPort, torrentID, bestFileIdx)
+	lanIP := getOutboundIP()
+	lanURL := ""
+	if lanIP != "" {
+		lanURL = fmt.Sprintf("http://%s:%d/torrents/%d/stream/%d", lanIP, StreamPort, torrentID, bestFileIdx)
+	}
+
+	_ = copyToClipboard(streamURL)
+	openVideoPlayer(streamURL)
+
+	runStreamLoop(torrentID, item.Title, fileName, fileSize, streamURL, lanURL, cacheDir, fd)
+}
+
+func runStreamLoop(torrentID int, title, fileName string, fileSize int64, streamURL, lanURL, cacheDir string, fd int) {
+	statusMsg := "Player intent launched! Tap play in Rex Player."
+	statsClient := &http.Client{Timeout: 2 * time.Second}
+
+	for {
+		statsURL := fmt.Sprintf("http://127.0.0.1:%d/torrents/%d/stats/v1", StreamPort, torrentID)
+		resp, err := statsClient.Get(statsURL)
+
+		var stats RqbitStreamStats
+		if err == nil && resp.StatusCode == 200 {
+			_ = json.NewDecoder(resp.Body).Decode(&stats)
+			resp.Body.Close()
+		} else if resp != nil {
+			resp.Body.Close()
+		}
+
+		var bufferedBytes int64 = 0
+		speedDown := "0.00 MiB/s"
+		speedUp := "0.00 MiB/s"
+		livePeers := 0
+
+		if stats.Live != nil {
+			bufferedBytes = stats.Live.Snapshot.DownloadedBytes
+			speedDown = stats.Live.DownloadSpeed.HumanReadable
+			speedUp = stats.Live.UploadSpeed.HumanReadable
+			livePeers = stats.Live.Snapshot.PeerStats.Live
+		}
+		if bufferedBytes == 0 && stats.ProgressBytes > 0 {
+			bufferedBytes = stats.ProgressBytes
+		}
+
+		totBytes := fileSize
+		if totBytes <= 0 {
+			totBytes = stats.TotalBytes
+		}
+		pct := 0.0
+		if totBytes > 0 {
+			pct = float64(bufferedBytes) / float64(totBytes) * 100
+			if pct > 100 {
+				pct = 100
+			}
+		}
+
+		cols, lines := getTerminalSize(fd)
+		divLen := cols - 4
+		if divLen < 40 {
+			divLen = 40
+		}
+
+		barWidth := cols - 32
+		if barWidth < 12 {
+			barWidth = 12
+		}
+		if barWidth > 40 {
+			barWidth = 40
+		}
+		filled := int(float64(barWidth) * pct / 100.0)
+		if filled > barWidth {
+			filled = barWidth
+		}
+		empty := barWidth - filled
+
+		var frame []string
+		hdr := fmt.Sprintf("%s%s⚡ TORQ STREAM ENGINE%s | %s%sZERO-DISK EPHEMERAL MODE%s", Bold, Cyan, Reset, Bold, Green, Reset)
+		frame = append(frame, "\r"+hdr+ClearLine)
+		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+
+		dispTitle := title
+		if len(dispTitle) > cols-12 {
+			dispTitle = dispTitle[:cols-15] + "..."
+		}
+		dispFile := fileName
+		if len(dispFile) > cols-12 {
+			dispFile = dispFile[:cols-15] + "..."
+		}
+
+		frame = append(frame, "\r"+fmt.Sprintf(" %sTitle:%s  %s%s%s", Bold, Reset, Bold, dispTitle, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sFile:%s   %s%s%s (%s)", Bold, Reset, Yellow, dispFile, Reset, formatBytes(fileSize))+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sStatus:%s %s▶ STREAMING LIVE TO PLAYER%s", Bold, Reset, Green, Reset)+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
+
+		frame = append(frame, "\r"+fmt.Sprintf(" %sDIRECT VIDEO STREAM URLS:%s", Bold, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf("  %s🔗 Rex Player / Local:%s %s%s%s", Bold, Reset, Cyan, streamURL, Reset)+ClearLine)
+		if lanURL != "" {
+			frame = append(frame, "\r"+fmt.Sprintf("  %s🌐 Wi-Fi / TV LAN:     %s %s%s%s", Bold, Reset, Magenta, lanURL, Reset)+ClearLine)
+		}
+		frame = append(frame, "\r"+ClearLine)
+
+		fillStr := fmt.Sprintf("%s%s%s%s", Bold, Green, strings.Repeat("█", filled), Reset)
+		emptyStr := fmt.Sprintf("%s%s%s", Dim, strings.Repeat("░", empty), Reset)
+		barDisplay := fmt.Sprintf(" Buffer: [%s%s] %s%5.1f%%%s (%s / %s)", fillStr, emptyStr, Bold, pct, Reset, formatBytes(bufferedBytes), formatBytes(totBytes))
+		frame = append(frame, "\r"+barDisplay+ClearLine)
+
+		metrics := fmt.Sprintf(" Stream Rate: %s▼ %s%s  %s▲ %s%s  |  Swarm: %s%d peers%s",
+			Green, speedDown, Reset,
+			Dim, speedUp, Reset,
+			Yellow, livePeers, Reset)
+		frame = append(frame, "\r"+metrics+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
+
+		frame = append(frame, "\r"+fmt.Sprintf(" %s🔒 ZERO-DISK GUARANTEE:%s", Yellow, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sEphemeral cache active. No file is saved to Downloads.%s", Dim, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf(" %sAll buffered chunks are immediately purged upon exit.%s", Dim, Reset)+ClearLine)
+
+		for len(frame) < lines-3 {
+			frame = append(frame, "\r"+ClearLine)
+		}
+
+		if statusMsg != "" {
+			frame = append(frame, "\r"+fmt.Sprintf("%s✔ %s%s", Green, statusMsg, Reset)+ClearLine)
+			statusMsg = ""
+		} else {
+			frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+		}
+
+		footer := fmt.Sprintf("%s[o]%s Re-open in Player  %s[c]%s Copy URL  %s[q]%s Stop & Purge Cache",
+			Bold, Reset, Bold, Reset, Bold, Reset)
+		frame = append(frame, "\r"+footer+ClearLine)
+
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
+
+		if hasKeyInput(fd, 400*time.Millisecond) {
+			k := readKey(fd)
+			switch strings.ToLower(k) {
+			case "o":
+				openVideoPlayer(streamURL)
+				statusMsg = "Re-sent player intent for Rex Player."
+			case "c":
+				if copyToClipboard(streamURL) {
+					statusMsg = "Stream URL copied to clipboard!"
+				} else {
+					statusMsg = "Failed to copy URL."
+				}
+			case "q", "quit", "esc", "x":
+				return
+			}
+		}
+	}
+}
+
+func handleStreamCommand(target, sourceFlag, qualityFlag string) {
+	if strings.HasPrefix(target, "magnet:?") {
+		item := TorrentItem{
+			Title:  "Direct Magnet Stream",
+			Magnet: target,
+			Source: "Magnet",
+		}
+		streamDashboard(item)
+		return
+	}
+
+	if target == "" {
+		fmt.Printf("%sEnter search query to stream (or magnet URI): %s", Bold, Reset)
+		reader := bufio.NewReader(os.Stdin)
+		inputTarget, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(inputTarget) == "" {
+			fmt.Printf("%sNo stream target provided.%s\n", Red, Reset)
+			return
+		}
+		target = strings.TrimSpace(inputTarget)
+		if strings.HasPrefix(target, "magnet:?") {
+			item := TorrentItem{
+				Title:  "Direct Magnet Stream",
+				Magnet: target,
+				Source: "Magnet",
+			}
+			streamDashboard(item)
+			return
+		}
+	}
+
+	results := performSearch(target, sourceFlag)
+	if len(results) == 0 {
+		fmt.Printf("%sNo results found for '%s'.%s\n", Yellow, target, Reset)
+		return
+	}
+
+	sort.SliceStable(results, func(i, j int) bool {
+		return results[i].Seeders > results[j].Seeders
+	})
+
+	streamDashboard(results[0])
+}
+
 func cancelDownloads(target string) {
 	ensureAriaDaemon(getDownloadsDir())
 	active := getActiveTasks()
@@ -1620,8 +2153,8 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 			frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 		}
 
-		footer := fmt.Sprintf("%s[▲/▼]%s Move  %s[Enter]%s Download  %s[t]%s Tier  %s[s]%s Src  %s[/]%s Filter  %s[q]%s Quit",
-			Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
+		footer := fmt.Sprintf("%s[▲/▼]%s Move  %s[Enter]%s DL  %s[p]%s Stream  %s[m]%s Mag  %s[t]%s Tier  %s[s]%s Src  %s[/]%s Filter  %s[q]%s Quit",
+			Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
 		frame = append(frame, "\r"+footer+ClearLine)
 
 		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
@@ -1690,6 +2223,12 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 					statusMsg = fmt.Sprintf("Magnet: %s...", shortMag)
 				}
 			}
+		case "p":
+			if totalItems > 0 {
+				item := filtered[selectedIdx]
+				streamDashboard(item)
+				fmt.Print("\033[?1049h\033[?25l" + ClearScrn)
+			}
 		case "enter", "d":
 			if totalItems > 0 {
 				item := filtered[selectedIdx]
@@ -1705,108 +2244,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 	}
 }
 
-func main() {
-	sourceFlag := flag.String("s", "all", "Tracker source to query (all, tpb, yts, nyaa, tosho)")
-	qualityFlag := flag.String("q", "all", "Filter by quality section (highest, high, medium, low)")
-	listFlag := flag.Bool("l", false, "List search results with sections and exit")
-	magnetFlag := flag.Bool("m", false, "Print magnet link of top result and exit")
-	downloadFlag := flag.Bool("d", false, "Instantly download top result via loading dashboard")
-	updateFlag := flag.Bool("u", false, "Check for and install updates from GitHub")
-	versionFlag := flag.Bool("v", false, "Show program version and exit")
-
-	flag.Usage = func() {
-		fmt.Printf("%s⚡ torq %s - Lightweight, keyboard-driven multi-tracker media engine for your terminal%s\n\n", Bold, Version, Reset)
-		fmt.Println("Usage: torq [flags] [query | queue | cancel | pause | resume]")
-		fmt.Println("\nCommands:")
-		fmt.Println("  torq queue             View active downloads and recent completed media")
-		fmt.Println("  torq cancel [all | N]  Cancel active background download(s)")
-		fmt.Println("  torq pause  [all | N]  Pause active background download(s)")
-		fmt.Println("  torq resume [all | N]  Resume paused background download(s)")
-		fmt.Println("\nFlags:")
-		flag.PrintDefaults()
-		fmt.Println("\nExamples:")
-		fmt.Println("  torq \"Doraemon\"")
-		fmt.Println("  torq queue")
-		fmt.Println("  torq cancel")
-		fmt.Println("  torq resume")
-		fmt.Println("  torq -q highest \"Oppenheimer\"")
-		fmt.Println("  torq --update")
-	}
-
-	flag.Parse()
-
-	if *versionFlag {
-		fmt.Printf("torq %s\n", Version)
-		return
-	}
-
-	if *updateFlag {
-		selfUpdate()
-		return
-	}
-
-	args := flag.Args()
-	firstWord := ""
-	if len(args) > 0 {
-		firstWord = strings.ToLower(args[0])
-	}
-
-	if firstWord == "cancel" || firstWord == "stop" {
-		target := "all"
-		if len(args) > 1 {
-			target = strings.ToLower(args[1])
-		}
-		cancelDownloads(target)
-		return
-	}
-
-	if firstWord == "pause" {
-		target := "all"
-		if len(args) > 1 {
-			target = strings.ToLower(args[1])
-		}
-		pauseDownloads(target)
-		return
-	}
-
-	if firstWord == "resume" || firstWord == "unpause" {
-		target := "all"
-		if len(args) > 1 {
-			target = strings.ToLower(args[1])
-		}
-		resumeDownloads(target)
-		return
-	}
-
-	queryStr := strings.TrimSpace(strings.Join(args, " "))
-
-	if strings.ToLower(queryStr) == "queue" || strings.ToLower(queryStr) == "q" {
-		destDir := getDownloadsDir()
-		queueManager(destDir)
-		return
-	}
-
-	if queryStr == "" {
-		fmt.Printf("%sSearch torrents for (or 'queue'): %s", Bold, Reset)
-		reader := bufio.NewReader(os.Stdin)
-		inputQuery, err := reader.ReadString('\n')
-		if err != nil || strings.TrimSpace(inputQuery) == "" {
-			fmt.Printf("%sNo search query provided.%s\n", Red, Reset)
-			os.Exit(1)
-		}
-		queryStr = strings.TrimSpace(inputQuery)
-	}
-
-	if strings.ToLower(queryStr) == "queue" || strings.ToLower(queryStr) == "q" {
-		destDir := getDownloadsDir()
-		queueManager(destDir)
-		return
-	}
-
-	if !*magnetFlag {
-		fmt.Fprintf(os.Stderr, "%sSearching multi-trackers for '%s'...%s\n", Cyan, queryStr, Reset)
-	}
-
+func performSearch(queryStr, sourceFlag string) []TorrentItem {
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
 	defer cancel()
 
@@ -1814,7 +2252,7 @@ func main() {
 	var rawResults []TorrentItem
 	var mu sync.Mutex
 
-	src := strings.ToLower(*sourceFlag)
+	src := strings.ToLower(sourceFlag)
 	if src == "all" || src == "tpb" || src == "thepiratebay" {
 		wg.Add(1)
 		go func() {
@@ -1881,7 +2319,123 @@ func main() {
 		}
 		dedupedResults = append(dedupedResults, it)
 	}
-	rawResults = dedupedResults
+	return dedupedResults
+}
+
+func main() {
+	sourceFlag := flag.String("s", "all", "Tracker source to query (all, tpb, yts, nyaa, tosho)")
+	qualityFlag := flag.String("q", "all", "Filter by quality section (highest, high, medium, low)")
+	listFlag := flag.Bool("l", false, "List search results with sections and exit")
+	magnetFlag := flag.Bool("m", false, "Print magnet link of top result and exit")
+	downloadFlag := flag.Bool("d", false, "Instantly download top result via loading dashboard")
+	streamFlag := flag.Bool("p", false, "Stream top result immediately in video player (Rex Player)")
+	flag.BoolVar(streamFlag, "stream", false, "Stream top result immediately in video player (Rex Player)")
+	updateFlag := flag.Bool("u", false, "Check for and install updates from GitHub")
+	versionFlag := flag.Bool("v", false, "Show program version and exit")
+
+	flag.Usage = func() {
+		fmt.Printf("%s⚡ torq %s - Lightweight, keyboard-driven multi-tracker media engine for your terminal%s\n\n", Bold, Version, Reset)
+		fmt.Println("Usage: torq [flags] [query | stream | queue | cancel | pause | resume]")
+		fmt.Println("\nCommands:")
+		fmt.Println("  torq stream <query|magnet>  Stream video directly in Rex Player (Zero-Disk)")
+		fmt.Println("  torq queue                  View active downloads and recent completed media")
+		fmt.Println("  torq cancel [all | N]       Cancel active background download(s)")
+		fmt.Println("  torq pause  [all | N]       Pause active background download(s)")
+		fmt.Println("  torq resume [all | N]       Resume paused background download(s)")
+		fmt.Println("\nFlags:")
+		flag.PrintDefaults()
+		fmt.Println("\nExamples:")
+		fmt.Println("  torq \"Doraemon\"")
+		fmt.Println("  torq stream \"Interstellar\"")
+		fmt.Println("  torq stream \"magnet:?xt=...\"")
+		fmt.Println("  torq queue")
+		fmt.Println("  torq cancel")
+		fmt.Println("  torq resume")
+		fmt.Println("  torq -q highest \"Oppenheimer\"")
+		fmt.Println("  torq --update")
+	}
+
+	flag.Parse()
+
+	if *versionFlag {
+		fmt.Printf("torq %s\n", Version)
+		return
+	}
+
+	if *updateFlag {
+		selfUpdate()
+		return
+	}
+
+	args := flag.Args()
+	firstWord := ""
+	if len(args) > 0 {
+		firstWord = strings.ToLower(args[0])
+	}
+
+	if firstWord == "stream" || firstWord == "play" {
+		target := strings.TrimSpace(strings.Join(args[1:], " "))
+		handleStreamCommand(target, *sourceFlag, *qualityFlag)
+		return
+	}
+
+	if firstWord == "cancel" || firstWord == "stop" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		cancelDownloads(target)
+		return
+	}
+
+	if firstWord == "pause" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		pauseDownloads(target)
+		return
+	}
+
+	if firstWord == "resume" || firstWord == "unpause" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		resumeDownloads(target)
+		return
+	}
+
+	queryStr := strings.TrimSpace(strings.Join(args, " "))
+
+	if strings.ToLower(queryStr) == "queue" || strings.ToLower(queryStr) == "q" {
+		destDir := getDownloadsDir()
+		queueManager(destDir)
+		return
+	}
+
+	if queryStr == "" {
+		fmt.Printf("%sSearch torrents for (or 'queue'): %s", Bold, Reset)
+		reader := bufio.NewReader(os.Stdin)
+		inputQuery, err := reader.ReadString('\n')
+		if err != nil || strings.TrimSpace(inputQuery) == "" {
+			fmt.Printf("%sNo search query provided.%s\n", Red, Reset)
+			os.Exit(1)
+		}
+		queryStr = strings.TrimSpace(inputQuery)
+	}
+
+	if strings.ToLower(queryStr) == "queue" || strings.ToLower(queryStr) == "q" {
+		destDir := getDownloadsDir()
+		queueManager(destDir)
+		return
+	}
+
+	if !*magnetFlag {
+		fmt.Fprintf(os.Stderr, "%sSearching multi-trackers for '%s'...%s\n", Cyan, queryStr, Reset)
+	}
+
+	rawResults := performSearch(queryStr, *sourceFlag)
 
 	if len(rawResults) == 0 {
 		fmt.Printf("%sNo results found for '%s'.%s\n", Yellow, queryStr, Reset)
@@ -1943,6 +2497,14 @@ func main() {
 	if *downloadFlag {
 		dest := getDownloadsDir()
 		downloadDashboard(sortedResults[0], dest)
+		return
+	}
+
+	if *streamFlag {
+		sort.SliceStable(sortedResults, func(i, j int) bool {
+			return sortedResults[i].Seeders > sortedResults[j].Seeders
+		})
+		streamDashboard(sortedResults[0])
 		return
 	}
 

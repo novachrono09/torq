@@ -1,0 +1,912 @@
+#!/usr/bin/env python3
+"""
+torq - A lightweight, keyboard-driven multi-tracker media engine for your terminal.
+Author: novachrono09
+Repo: https://github.com/novachrono09/torq
+License: MIT
+"""
+
+import sys
+import os
+import argparse
+import urllib.request
+import urllib.parse
+import json
+import xml.etree.ElementTree as ET
+import subprocess
+import re
+import math
+import time
+import tty
+import termios
+import select
+import shutil
+
+VERSION = "1.0.0"
+GITHUB_RAW_URL = "https://raw.githubusercontent.com/novachrono09/torq/main/torq"
+
+# ANSI Styling
+BOLD = "\033[1m"
+GREEN = "\033[32m"
+CYAN = "\033[36m"
+YELLOW = "\033[33m"
+RED = "\033[31m"
+MAGENTA = "\033[35m"
+BLUE = "\033[34m"
+WHITE = "\033[37m"
+DIM = "\033[2m"
+RESET = "\033[0m"
+
+CLEAR_LINE = "\033[K"
+CLEAR_SCREEN = "\033[2J\033[H"
+MOVE_TOP = "\033[H"
+
+HL_BG = "\033[44;97;1m"
+HL_ARROW = f"{BOLD}{CYAN}▶{RESET}"
+
+TOP_TRACKERS = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "udp://tracker.bittor.pw:1337/announce",
+    "udp://public.popcorn-tracker.org:6969/announce",
+    "udp://tracker.dler.org:6969/announce",
+    "udp://exodus.desync.com:6969/announce",
+    "udp://open.demonii.com:1337/announce",
+    "udp://tracker.coppersurfer.tk:6969/announce",
+    "udp://tracker.openbittorrent.com:6969/announce"
+]
+
+QUALITY_ORDER = [
+    "Highest Quality (4K / UHD / Remux)",
+    "High Quality (1080p / FHD / BD)",
+    "Medium Quality (720p / HD)",
+    "Low Quality (480p / SD / CAM)",
+    "Standard / General Media"
+]
+
+QUALITY_SHORT = {
+    "Highest Quality (4K / UHD / Remux)": "4K / Remux",
+    "High Quality (1080p / FHD / BD)": "1080p FHD",
+    "Medium Quality (720p / HD)": "720p HD",
+    "Low Quality (480p / SD / CAM)": "480p SD",
+    "Standard / General Media": "General"
+}
+
+QUALITY_COLORS = {
+    "Highest Quality (4K / UHD / Remux)": "\033[1;35m",
+    "High Quality (1080p / FHD / BD)": "\033[1;32m",
+    "Medium Quality (720p / HD)": "\033[1;33m",
+    "Low Quality (480p / SD / CAM)": "\033[1;31m",
+    "Standard / General Media": "\033[1;36m"
+}
+
+def format_bytes(bytes_num):
+    if bytes_num >= 1024**3:
+        return f"{bytes_num / (1024**3):.2f} GiB"
+    elif bytes_num >= 1024**2:
+        return f"{bytes_num / (1024**2):.1f} MiB"
+    elif bytes_num >= 1024:
+        return f"{bytes_num / 1024:.1f} KiB"
+    return f"{bytes_num} B"
+
+def format_speed(bps):
+    if bps >= 1024**2:
+        return f"{bps / (1024**2):.2f} MiB/s"
+    elif bps >= 1024:
+        return f"{bps / 1024:.1f} KiB/s"
+    return f"{bps} B/s"
+
+def format_time(seconds):
+    if seconds <= 0 or seconds > 86400 * 30:
+        return "--:--"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h:d}h {m:02d}m"
+    return f"{m:02d}m {s:02d}s"
+
+def detect_quality_tier(title):
+    t = title.lower()
+    if re.search(r'\b(480p|360p|240p|dvdrip|camrip|hdcam|telesync|telecine|vcd|cam|ts|tc)\b', t):
+        return "Low Quality (480p / SD / CAM)"
+    if re.search(r'\b(2160p|4k|uhd|remux|bdremux)\b', t):
+        return "Highest Quality (4K / UHD / Remux)"
+    if re.search(r'\b(1080p|fhd|1080i)\b', t):
+        return "High Quality (1080p / FHD / BD)"
+    if (('bluray' in t or 'bdrip' in t or 'blu-ray' in t) and not re.search(r'\b(720p|480p)\b', t)):
+        return "High Quality (1080p / FHD / BD)"
+    if re.search(r'\b(720p|hdrip|hdtv|720i)\b', t):
+        return "Medium Quality (720p / HD)"
+    return "Standard / General Media"
+
+def inject_trackers(magnet_uri, title=""):
+    tr_params = "&".join(f"tr={urllib.parse.quote(tr, safe='')}" for tr in TOP_TRACKERS)
+    if "magnet:?" not in magnet_uri:
+        return magnet_uri
+    if "&tr=" in magnet_uri:
+        return f"{magnet_uri}&{tr_params}"
+    else:
+        dn = f"&dn={urllib.parse.quote(title)}" if title and "&dn=" not in magnet_uri else ""
+        return f"{magnet_uri}{dn}&{tr_params}"
+
+def search_tpb(query, cat=0):
+    url = f"https://apibay.org/q.php?q={urllib.parse.quote(query)}"
+    if cat:
+        url += f"&cat={cat}"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    results = []
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+            for item in data:
+                if item.get("name") == "No results returned":
+                    continue
+                info_hash = item.get("info_hash", "")
+                name = item.get("name", "Untitled")
+                try:
+                    raw_size = int(item.get("size", 0))
+                    size_str = format_bytes(raw_size)
+                except Exception:
+                    raw_size = 0
+                    size_str = "Unknown"
+
+                seeders = int(item.get("seeders", 0))
+                leechers = int(item.get("leechers", 0))
+                cat_id = item.get("category", "")
+                tier = detect_quality_tier(name)
+
+                base_magnet = f"magnet:?xt=urn:btih:{info_hash}&dn={urllib.parse.quote(name)}"
+                magnet = inject_trackers(base_magnet, name)
+
+                results.append({
+                    "title": name,
+                    "source": "ThePirateBay",
+                    "seeders": seeders,
+                    "leechers": leechers,
+                    "size": size_str,
+                    "raw_size": raw_size,
+                    "category": f"TPB ({cat_id})",
+                    "tier": tier,
+                    "magnet": magnet
+                })
+    except Exception:
+        pass
+    return results
+
+def search_nyaa(query):
+    url = f"https://nyaa.si/?page=rss&q={urllib.parse.quote(query)}&s=seeders&o=desc"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Mobile Safari/537.36"
+    }
+    req = urllib.request.Request(url, headers=headers)
+    results = []
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            content = resp.read()
+            root = ET.fromstring(content)
+            ns = {"nyaa": "https://nyaa.si/xmlns/nyaa"}
+            for item in root.findall("./channel/item"):
+                title = item.find("title").text if item.find("title") is not None else "Untitled"
+                seeders = item.find("nyaa:seeders", ns)
+                leechers = item.find("nyaa:leechers", ns)
+                info_hash = item.find("nyaa:infoHash", ns)
+                size = item.find("nyaa:size", ns)
+                cat = item.find("nyaa:category", ns)
+
+                s_val = int(seeders.text) if seeders is not None and seeders.text else 0
+                l_val = int(leechers.text) if leechers is not None and leechers.text else 0
+                hash_val = info_hash.text if info_hash is not None and info_hash.text else ""
+                size_val = size.text if size is not None and size.text else "N/A"
+                cat_val = cat.text if cat is not None and cat.text else "Anime"
+                tier = detect_quality_tier(title)
+
+                base_magnet = f"magnet:?xt=urn:btih:{hash_val}&dn={urllib.parse.quote(title)}" if hash_val else ""
+                magnet = inject_trackers(base_magnet, title) if base_magnet else ""
+
+                results.append({
+                    "title": title,
+                    "source": "Nyaa",
+                    "seeders": s_val,
+                    "leechers": l_val,
+                    "size": size_val,
+                    "raw_size": 0,
+                    "category": cat_val,
+                    "tier": tier,
+                    "magnet": magnet
+                })
+    except Exception:
+        pass
+    return results
+
+def get_downloads_dir():
+    candidates = [
+        "/sdcard/Download",
+        os.path.expanduser("~/storage/downloads"),
+        os.path.expanduser("~/Downloads"),
+        os.getcwd()
+    ]
+    for p in candidates:
+        if os.path.isdir(p) and os.access(p, os.W_OK):
+            return p
+    return os.getcwd()
+
+def check_disk_space(dest_dir, required_bytes):
+    try:
+        _, _, free = shutil.disk_usage(dest_dir)
+        if required_bytes > 0 and free < required_bytes:
+            return False, free
+        return True, free
+    except Exception:
+        return True, 0
+
+def copy_to_clipboard(text):
+    if shutil.which("termux-clipboard-set"):
+        try:
+            p = subprocess.Popen(["termux-clipboard-set"], stdin=subprocess.PIPE)
+            p.communicate(input=text.encode("utf-8"))
+            return True
+        except Exception:
+            pass
+    return False
+
+def send_notification(title, message):
+    if shutil.which("termux-notification"):
+        try:
+            subprocess.run([
+                "termux-notification",
+                "--title", title,
+                "--content", message,
+                "--priority", "high"
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+def read_key():
+    if not sys.stdin.isatty():
+        ch = sys.stdin.read(1)
+        return ch if ch else 'q'
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        ch = sys.stdin.read(1)
+        if ch == '\x1b':
+            time.sleep(0.06)
+            os.set_blocking(fd, False)
+            seq = ""
+            while True:
+                more = sys.stdin.read(1)
+                if not more:
+                    break
+                seq += more
+            os.set_blocking(fd, True)
+
+            if not seq:
+                return 'ESC'
+            if seq in ('[A', 'OA'): return 'UP'
+            elif seq in ('[B', 'OB'): return 'DOWN'
+            elif seq in ('[C', 'OC'): return 'RIGHT'
+            elif seq in ('[D', 'OD'): return 'LEFT'
+            return f'ESC_{seq}'
+        elif ch in ('\r', '\n'):
+            return 'ENTER'
+        elif ch == '\t':
+            return 'TAB'
+        elif ch in ('\x03', '\x04'):
+            return 'QUIT'
+        elif ch == ' ':
+            return 'SPACE'
+        elif ch in ('\x7f', '\x08'):
+            return 'BACKSPACE'
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+RPC_PORT = 6800
+RPC_SECRET = "torq_secret_session"
+
+class Aria2Session:
+    @staticmethod
+    def ensure_daemon(dest_dir):
+        try:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{RPC_PORT}/jsonrpc",
+                data=json.dumps({"jsonrpc": "2.0", "id": "p", "method": "aria2.getVersion", "params": [f"token:{RPC_SECRET}"]}).encode(),
+                headers={"Content-Type": "application/json"}
+            )
+            urllib.request.urlopen(req, timeout=0.5)
+            return
+        except Exception:
+            pass
+
+        trackers_arg = ",".join(TOP_TRACKERS)
+        cmd = [
+            "aria2c",
+            "--enable-rpc=true",
+            f"--rpc-listen-port={RPC_PORT}",
+            f"--rpc-secret={RPC_SECRET}",
+            f"--dir={dest_dir}",
+            "--seed-time=0",
+            "--file-allocation=none",
+            "--bt-max-peers=140",
+            "--bt-request-peer-speed-limit=0",
+            "--max-connection-per-server=16",
+            "--split=16",
+            "--min-split-size=1M",
+            "--piece-length=1M",
+            "--enable-dht=true",
+            "--enable-dht6=true",
+            "--bt-enable-lpd=true",
+            "--enable-peer-exchange=true",
+            f"--bt-tracker={trackers_arg}",
+            "--async-dns=true",
+            "--summary-interval=0",
+            "--quiet=true",
+            "--daemon=true"
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(0.5)
+
+    @staticmethod
+    def rpc(method, params=None):
+        if params is None:
+            params = []
+        payload = json.dumps({
+            "jsonrpc": "2.0",
+            "id": "torq",
+            "method": method,
+            "params": [f"token:{RPC_SECRET}"] + params
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{RPC_PORT}/jsonrpc",
+            data=payload,
+            headers={"Content-Type": "application/json"}
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("result")
+        except Exception:
+            return None
+
+    @staticmethod
+    def add_magnet(magnet):
+        return Aria2Session.rpc("aria2.addUri", [[magnet]])
+
+    @staticmethod
+    def pause(gid):
+        return Aria2Session.rpc("aria2.pause", [gid])
+
+    @staticmethod
+    def unpause(gid):
+        return Aria2Session.rpc("aria2.unpause", [gid])
+
+    @staticmethod
+    def remove(gid):
+        return Aria2Session.rpc("aria2.remove", [gid])
+
+    @staticmethod
+    def get_current_task():
+        actives = Aria2Session.rpc("aria2.tellActive") or []
+        for a in actives:
+            files = a.get("files", [])
+            if files and not files[0].get("path", "").startswith("[METADATA]"):
+                return a
+        if actives:
+            return actives[0]
+
+        waiting = Aria2Session.rpc("aria2.tellWaiting", [0, 5]) or []
+        for w in waiting:
+            files = w.get("files", [])
+            if files and not files[0].get("path", "").startswith("[METADATA]"):
+                return w
+
+        stopped = Aria2Session.rpc("aria2.tellStopped", [0, 5]) or []
+        for s in stopped:
+            files = s.get("files", [])
+            if files and not files[0].get("path", "").startswith("[METADATA]"):
+                return s
+
+        return None
+
+def download_dashboard(item, dest_dir):
+    Aria2Session.ensure_daemon(dest_dir)
+    Aria2Session.add_magnet(item["magnet"])
+
+    sys.stdout.write("\033[?25l" + CLEAR_SCREEN)
+    sys.stdout.flush()
+
+    status_msg = ""
+    is_paused = False
+
+    try:
+        while True:
+            try:
+                cols, lines = os.get_terminal_size()
+            except Exception:
+                cols, lines = 80, 24
+
+            task = Aria2Session.get_current_task()
+
+            status_text = task.get("status", "connecting") if task else "connecting"
+            total = int(task.get("totalLength", 0)) if task else 0
+            completed = int(task.get("completedLength", 0)) if task else 0
+            speed = int(task.get("downloadSpeed", 0)) if task else 0
+            seeders = int(task.get("numSeeders", 0)) if task else 0
+            conns = int(task.get("connections", 0)) if task else 0
+            gid = task.get("gid") if task else None
+
+            file_name = item["title"]
+            file_path = None
+            is_metadata_phase = True
+
+            if task and task.get("files"):
+                p = task["files"][0].get("path", "")
+                if p and not p.startswith("[METADATA]") and not p.startswith("[MEMORY]"):
+                    is_metadata_phase = False
+                    file_path = p
+                    file_name = os.path.basename(p)
+
+            pct = (completed / total * 100) if total > 0 and not is_metadata_phase else 0.0
+            eta_sec = ((total - completed) / speed) if speed > 0 and total > completed else 0
+
+            frame = [MOVE_TOP]
+
+            hdr = f"{BOLD}{CYAN}⚡ TORQ DOWNLOAD MANAGER{RESET} {DIM}───{RESET} {BOLD}{MAGENTA}[{item['source']}]{RESET}"
+            frame.append(hdr[:cols] + CLEAR_LINE)
+            frame.append(f"{DIM}━" * min(cols - 1, 78) + f"{RESET}" + CLEAR_LINE)
+
+            frame.append(f"{BOLD}File:{RESET} {WHITE}{file_name[:cols - 8]}{RESET}" + CLEAR_LINE)
+            frame.append(f"{BOLD}Path:{RESET} {DIM}{dest_dir}{RESET}" + CLEAR_LINE)
+            frame.append(CLEAR_LINE)
+
+            if is_metadata_phase:
+                badge = f"{MAGENTA}◐ CONNECTING TO PEERS & FETCHING METADATA...{RESET}"
+            elif status_text == "active":
+                badge = f"{GREEN}● DOWNLOADING{RESET}"
+            elif status_text == "paused":
+                badge = f"{YELLOW}❚❚ PAUSED{RESET}"
+            elif status_text == "complete":
+                badge = f"{BOLD}{CYAN}✔ COMPLETED{RESET}"
+            elif status_text == "removed":
+                badge = f"{RED}✖ CANCELLED{RESET}"
+            else:
+                badge = f"{YELLOW}● {status_text.upper()}{RESET}"
+
+            frame.append(f"{BOLD}Status:{RESET} {badge}   {BOLD}Peers:{RESET} {conns} connected ({seeders} seeds)" + CLEAR_LINE)
+            frame.append(CLEAR_LINE)
+
+            bar_width = max(15, min(cols - 30, 48))
+            filled = int(bar_width * pct / 100)
+            empty = bar_width - filled
+
+            fill_str = f"{BOLD}{CYAN}{'█' * filled}{RESET}"
+            empty_str = f"{DIM}{'░' * empty}{RESET}"
+            bar_display = f"[{fill_str}{empty_str}] {BOLD}{WHITE}{pct:5.1f}%{RESET}"
+            frame.append(f"{bar_display}" + CLEAR_LINE)
+            frame.append(CLEAR_LINE)
+
+            if is_metadata_phase:
+                metrics = f"{DIM}Finding best swarm seeds and resolving file pieces...{RESET}"
+            else:
+                metrics = (
+                    f"{BOLD}Speed:{RESET} {GREEN}{format_speed(speed):<12}{RESET} "
+                    f"{BOLD}Data:{RESET} {format_bytes(completed)} / {format_bytes(total)}   "
+                    f"{BOLD}ETA:{RESET} {YELLOW}{format_time(eta_sec)}{RESET}"
+                )
+            frame.append(metrics[:cols] + CLEAR_LINE)
+            frame.append(CLEAR_LINE)
+
+            used = len(frame)
+            for _ in range(max(0, lines - used - 4)):
+                frame.append(CLEAR_LINE)
+
+            if status_msg:
+                frame.append(f"{CYAN}ℹ {status_msg}{RESET}" + CLEAR_LINE)
+                status_msg = ""
+            else:
+                frame.append(f"{DIM}━" * min(cols - 1, 78) + f"{RESET}" + CLEAR_LINE)
+
+            if status_text == "complete":
+                controls = f"{BOLD}[Enter/q]{RESET} Return to Search   {BOLD}[o]{RESET} Open File in Player"
+            elif status_text in ("removed", "error"):
+                controls = f"{BOLD}[Enter/q]{RESET} Return to Search"
+            else:
+                pause_label = "Resume" if is_paused else "Pause"
+                controls = (
+                    f"{BOLD}[p/Space]{RESET} {pause_label}   "
+                    f"{BOLD}[c]{RESET} Cancel   "
+                    f"{BOLD}[b]{RESET} Run in Background   "
+                    f"{BOLD}[q]{RESET} Return"
+                )
+            frame.append(controls[:cols] + CLEAR_LINE)
+
+            sys.stdout.write("\n".join(frame))
+            sys.stdout.flush()
+
+            if status_text == "complete":
+                send_notification("Torq Download Complete!", f"{file_name} finished downloading.")
+                k = read_key()
+                if k in ('o', 'O') and file_path and os.path.exists(file_path):
+                    subprocess.run(["termux-open", file_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+
+            if status_text in ("removed", "error"):
+                read_key()
+                break
+
+            rlist, _, _ = select.select([sys.stdin], [], [], 0.6)
+            if rlist:
+                key = read_key()
+                if key in ('p', 'P', 'SPACE') and gid:
+                    if is_paused:
+                        Aria2Session.unpause(gid)
+                        is_paused = False
+                        status_msg = "Download Resumed"
+                    else:
+                        Aria2Session.pause(gid)
+                        is_paused = True
+                        status_msg = "Download Paused"
+                elif key in ('c', 'C', 'x', 'X') and gid:
+                    Aria2Session.remove(gid)
+                    status_msg = "Download Cancelled"
+                elif key in ('b', 'B'):
+                    sys.stdout.write("\033[?25h\n")
+                    sys.stdout.flush()
+                    print(f"\n{GREEN}✔ Download running in background!{RESET}")
+                    print(f"{DIM}Saved to: {dest_dir}{RESET}\n")
+                    return
+                elif key in ('q', 'Q', 'QUIT'):
+                    if gid:
+                        Aria2Session.remove(gid)
+                    break
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+def queue_manager(dest_dir):
+    sys.stdout.write(CLEAR_SCREEN)
+    v_exts = ('.mkv', '.mp4', '.avi', '.webm', '.zip', '.apk', '.iso', '.torrent')
+    files = []
+    if os.path.exists(dest_dir):
+        for f in os.listdir(dest_dir):
+            if f.endswith(v_exts) and not f.endswith('.aria2'):
+                fp = os.path.join(dest_dir, f)
+                try:
+                    files.append((f, os.path.getsize(fp), os.path.getmtime(fp)))
+                except Exception:
+                    pass
+    files.sort(key=lambda x: x[2], reverse=True)
+
+    print(f"{BOLD}{CYAN}📋 TORQ DOWNLOAD MANAGER & RECENT DOWNLOADS{RESET}")
+    print(f"Location: {YELLOW}{dest_dir}{RESET}")
+    print(f"{DIM}━" * 65 + f"{RESET}\n")
+
+    if not files:
+        print(f"{YELLOW}No recent completed media found in {dest_dir}.{RESET}\n")
+    else:
+        for idx, (fname, sz, _) in enumerate(files[:15], 1):
+            print(f" {BOLD}{CYAN}[{idx:2d}]{RESET} {WHITE}{fname[:50]:<52}{RESET} {YELLOW}{format_bytes(sz)}{RESET}")
+
+    print(f"\n{DIM}━" * 65 + f"{RESET}")
+    print(f"{BOLD}[1-{min(len(files), 15)}]{RESET} Open File in Player  {BOLD}[o]{RESET} Open Folder  {BOLD}[q]{RESET} Return\n")
+
+    try:
+        ch = input(f"{BOLD}Action > {RESET}").strip().lower()
+        if ch == 'o':
+            subprocess.run(["termux-open", dest_dir])
+        elif ch.isdigit() and 1 <= int(ch) <= len(files):
+            chosen_file = os.path.join(dest_dir, files[int(ch) - 1][0])
+            subprocess.run(["termux-open", chosen_file])
+    except Exception:
+        pass
+
+def self_update():
+    """Auto-updater: updates torq directly from GitHub."""
+    print(f"{CYAN}Checking for updates from GitHub...{RESET}")
+    target_path = shutil.which("torq") or "/data/data/com.termux/files/usr/bin/torq"
+    try:
+        req = urllib.request.Request(GITHUB_RAW_URL, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            new_code = resp.read()
+        if new_code:
+            with open(target_path, "wb") as f:
+                f.write(new_code)
+            os.chmod(target_path, 0o755)
+            if shutil.which("termux-fix-shebang"):
+                subprocess.run(["termux-fix-shebang", target_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"{GREEN}✔ Successfully updated torq to the latest version!{RESET}")
+        else:
+            print(f"{RED}Update failed: empty file received.{RESET}")
+    except Exception as e:
+        print(f"{RED}Update failed: {e}{RESET}")
+
+def run_tui(all_items, initial_query=""):
+    sys.stdout.write("\033[?25l")
+    sys.stdout.flush()
+
+    tier_filters = ["ALL"] + QUALITY_ORDER
+    current_tier_idx = 0
+    source_filters = ["ALL", "ThePirateBay", "Nyaa"]
+    current_source_idx = 0
+    search_filter = ""
+
+    selected_idx = 0
+    status_msg = ""
+    dest_dir = get_downloads_dir()
+
+    try:
+        sys.stdout.write(CLEAR_SCREEN)
+        sys.stdout.flush()
+
+        while True:
+            try:
+                cols, lines = os.get_terminal_size()
+            except Exception:
+                cols, lines = 80, 24
+
+            filtered = all_items
+            target_tier = tier_filters[current_tier_idx]
+            if target_tier != "ALL":
+                filtered = [x for x in filtered if x.get("tier") == target_tier]
+
+            target_source = source_filters[current_source_idx]
+            if target_source != "ALL":
+                filtered = [x for x in filtered if x.get("source") == target_source]
+
+            if search_filter:
+                filtered = [x for x in filtered if search_filter.lower() in x.get("title", "").lower()]
+
+            total_items = len(filtered)
+            if total_items == 0:
+                selected_idx = 0
+            else:
+                selected_idx = max(0, min(selected_idx, total_items - 1))
+
+            items_per_page = max(3, (lines - 7) // 2)
+            total_pages = max(1, math.ceil(total_items / items_per_page)) if total_items > 0 else 1
+            current_page = (selected_idx // items_per_page) + 1 if total_items > 0 else 1
+
+            start_idx = (current_page - 1) * items_per_page
+            end_idx = min(start_idx + items_per_page, total_items)
+
+            frame = [MOVE_TOP]
+
+            tier_label = QUALITY_SHORT.get(target_tier, target_tier)
+            q_disp = initial_query[:18]
+            hdr = f"{BOLD}{CYAN}⚡ TORQ TUI{RESET} | {BOLD}{YELLOW}{q_disp}{RESET} | Tier: {MAGENTA}[{tier_label}]{RESET} | Src: {BLUE}[{target_source}]{RESET} | Pg: {BOLD}{current_page}/{total_pages}{RESET}"
+            frame.append(hdr[:cols] + CLEAR_LINE)
+
+            if search_filter:
+                frame.append(f"{YELLOW}Filter (/): {search_filter}{RESET}" + CLEAR_LINE)
+            else:
+                frame.append(f"{DIM}━" * min(cols - 1, 78) + f"{RESET}" + CLEAR_LINE)
+
+            if total_items == 0:
+                frame.append(f"\n   {YELLOW}No torrents found matching active filters.{RESET}" + CLEAR_LINE)
+                frame.append(f"   {DIM}Press 't' to reset quality tier or 's' to reset source.{RESET}" + CLEAR_LINE)
+            else:
+                current_section = None
+                for idx in range(start_idx, end_idx):
+                    item = filtered[idx]
+                    tier = item.get("tier", "Standard / General Media")
+                    is_active = (idx == selected_idx)
+
+                    if target_tier == "ALL" and tier != current_section:
+                        current_section = tier
+                        color = QUALITY_COLORS.get(tier, BOLD)
+                        frame.append(f"{color}── {tier} ──{RESET}" + CLEAR_LINE)
+
+                    s_color = GREEN if item["seeders"] > 5 else (YELLOW if item["seeders"] > 0 else RED)
+                    src_tag = f"{MAGENTA}[{item['source']}]{RESET}"
+                    title_display = item["title"][:cols - 14]
+
+                    if is_active:
+                        line1 = f"{HL_ARROW} {HL_BG}[{idx + 1:2d}] {title_display}{RESET}"
+                        line2 = f"   {src_tag} Size: {YELLOW}{item['size']}{RESET} | Seeders: {s_color}{item['seeders']}{RESET} | Leechers: {DIM}{item['leechers']}{RESET} | {DIM}{item['category']}{RESET}"
+                    else:
+                        line1 = f"   {CYAN}[{idx + 1:2d}]{RESET} {title_display}"
+                        line2 = f"   {src_tag} Size: {YELLOW}{item['size']}{RESET} | Seeders: {s_color}{item['seeders']}{RESET} | Leechers: {DIM}{item['leechers']}{RESET} | {DIM}{item['category']}{RESET}"
+
+                    frame.append(line1 + CLEAR_LINE)
+                    frame.append(line2 + CLEAR_LINE)
+
+            used = len(frame)
+            for _ in range(max(0, lines - used - 2)):
+                frame.append(CLEAR_LINE)
+
+            if status_msg:
+                frame.append(f"{GREEN}✔ {status_msg}{RESET}" + CLEAR_LINE)
+                status_msg = ""
+            else:
+                frame.append(f"{DIM}━" * min(cols - 1, 78) + f"{RESET}" + CLEAR_LINE)
+
+            footer = (
+                f"{BOLD}[▲/▼]{RESET} Nav  "
+                f"{BOLD}[Enter/d]{RESET} Download  "
+                f"{BOLD}[Q]{RESET} Queue  "
+                f"{BOLD}[m]{RESET} Magnet  "
+                f"{BOLD}[t]{RESET} Tier  "
+                f"{BOLD}[s]{RESET} Source  "
+                f"{BOLD}[q]{RESET} Quit"
+            )
+            frame.append(footer[:cols] + CLEAR_LINE)
+
+            sys.stdout.write("\n".join(frame))
+            sys.stdout.flush()
+
+            k = read_key()
+
+            if k in ('q', 'Q', 'QUIT'):
+                break
+            elif k in ('UP', 'k') and selected_idx > 0:
+                selected_idx -= 1
+            elif k in ('DOWN', 'j') and selected_idx < total_items - 1:
+                selected_idx += 1
+            elif k in ('RIGHT', 'l', 'n') and current_page < total_pages:
+                selected_idx = min(start_idx + items_per_page, total_items - 1)
+            elif k in ('LEFT', 'h', 'p') and current_page > 1:
+                selected_idx = max(0, start_idx - items_per_page)
+            elif k in ('t', 'TAB'):
+                current_tier_idx = (current_tier_idx + 1) % len(tier_filters)
+                selected_idx = 0
+            elif k == 's':
+                current_source_idx = (current_source_idx + 1) % len(source_filters)
+                selected_idx = 0
+            elif k == 'Q':
+                sys.stdout.write("\033[?25h")
+                queue_manager(dest_dir)
+                sys.stdout.write("\033[?25l" + CLEAR_SCREEN)
+            elif k == '/':
+                sys.stdout.write("\033[?25h\n\033[KEnter filter text (Enter to apply, empty to clear): ")
+                sys.stdout.flush()
+                try:
+                    search_filter = input().strip()
+                except Exception:
+                    search_filter = ""
+                sys.stdout.write("\033[?25l")
+                selected_idx = 0
+            elif k in ('m', 'M') and total_items > 0:
+                item = filtered[selected_idx]
+                copied = copy_to_clipboard(item["magnet"])
+                if copied:
+                    status_msg = f"Magnet copied to clipboard! ({item['title'][:32]}...)"
+                else:
+                    status_msg = f"Magnet: {item['magnet'][:50]}..."
+            elif k in ('ENTER', 'd', 'D') and total_items > 0:
+                item = filtered[selected_idx]
+                has_space, free_b = check_disk_space(dest_dir, item.get("raw_size", 0))
+                if not has_space:
+                    sys.stdout.write("\033[?25h\n")
+                    print(f"\n{BOLD}{RED}⚠️  DISK SPACE WARNING{RESET}")
+                    print(f"Torrent Size: {YELLOW}{item['size']}{RESET} | Free on /sdcard: {RED}{format_bytes(free_b)}{RESET}")
+                    proceed = input(f"{BOLD}Proceed anyway? [y/N]: {RESET}").strip().lower()
+                    if proceed not in ('y', 'yes'):
+                        sys.stdout.write("\033[?25l" + CLEAR_SCREEN)
+                        continue
+                download_dashboard(item, dest_dir)
+                sys.stdout.write(CLEAR_SCREEN)
+    finally:
+        sys.stdout.write("\033[?25h\n")
+        sys.stdout.flush()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="⚡ torq - Lightweight, keyboard-driven multi-tracker media engine for your terminal",
+        epilog="""Examples:
+  torq "Doraemon"
+  torq queue
+  torq -q highest "Oppenheimer"
+  torq --update
+"""
+    )
+    parser.add_argument("query", nargs="*", help="Search terms or 'queue'")
+    parser.add_argument("-s", "--source", choices=["all", "tpb", "nyaa"], default="all",
+                        help="Tracker source to query (default: all)")
+    parser.add_argument("-q", "--quality", choices=["all", "highest", "high", "medium", "low"], default="all",
+                        help="Filter by quality section (highest=4K/Remux, high=1080p, medium=720p, low=480p)")
+    parser.add_argument("-l", "--list", action="store_true",
+                        help="List search results with sections and exit")
+    parser.add_argument("-m", "--magnet", action="store_true",
+                        help="Print magnet link of top result and exit")
+    parser.add_argument("-d", "--download", action="store_true",
+                        help="Instantly download top result via loading dashboard")
+    parser.add_argument("-u", "--update", action="store_true",
+                        help="Check for and install updates from GitHub")
+    parser.add_argument("-v", "--version", action="version", version=f"torq {VERSION}")
+
+    args = parser.parse_args()
+
+    if args.update:
+        self_update()
+        sys.exit(0)
+
+    query_str = " ".join(args.query).strip()
+
+    if query_str.lower() in ("queue", "q"):
+        dest_dir = get_downloads_dir()
+        queue_manager(dest_dir)
+        sys.exit(0)
+
+    if not query_str:
+        try:
+            query_str = input(f"{BOLD}Search torrents for (or 'queue'): {RESET}").strip()
+        except (KeyboardInterrupt, EOFError):
+            sys.exit(0)
+
+    if not query_str:
+        print(f"{RED}No search query provided.{RESET}")
+        sys.exit(1)
+
+    if query_str.lower() in ("queue", "q"):
+        dest_dir = get_downloads_dir()
+        queue_manager(dest_dir)
+        sys.exit(0)
+
+    print(f"{CYAN}Searching multi-trackers for '{query_str}'...{RESET}")
+
+    raw_results = []
+    if args.source in ("all", "tpb"):
+        raw_results.extend(search_tpb(query_str))
+    if args.source in ("all", "nyaa"):
+        raw_results.extend(search_nyaa(query_str))
+
+    if not raw_results:
+        print(f"{YELLOW}No results found for '{query_str}'.{RESET}")
+        sys.exit(0)
+
+    if args.quality != "all":
+        q_map = {
+            "highest": "Highest Quality (4K / UHD / Remux)",
+            "high": "High Quality (1080p / FHD / BD)",
+            "medium": "Medium Quality (720p / HD)",
+            "low": "Low Quality (480p / SD / CAM)"
+        }
+        target_tier = q_map[args.quality]
+        raw_results = [r for r in raw_results if r.get("tier") == target_tier]
+        if not raw_results:
+            print(f"{YELLOW}No results found in {target_tier} section for '{query_str}'.{RESET}")
+            sys.exit(0)
+
+    sorted_results = []
+    for tier in QUALITY_ORDER:
+        tier_items = [r for r in raw_results if r.get("tier") == tier]
+        tier_items.sort(key=lambda x: x.get("seeders", 0), reverse=True)
+        sorted_results.extend(tier_items)
+
+    remainder = [r for r in raw_results if r.get("tier") not in set(QUALITY_ORDER)]
+    remainder.sort(key=lambda x: x.get("seeders", 0), reverse=True)
+    sorted_results.extend(remainder)
+
+    if args.magnet:
+        print(sorted_results[0]["magnet"])
+        sys.exit(0)
+
+    if args.download:
+        dest = get_downloads_dir()
+        download_dashboard(sorted_results[0], dest)
+        sys.exit(0)
+
+    if args.list or not sys.stdin.isatty():
+        current_section = None
+        for idx, item in enumerate(sorted_results[:30], 1):
+            tier = item.get("tier", "Standard / General Media")
+            if tier != current_section:
+                current_section = tier
+                color = QUALITY_COLORS.get(tier, BOLD)
+                print(f"\n{color}━━━ {tier} ━━━{RESET}")
+            s_color = GREEN if item["seeders"] > 5 else (YELLOW if item["seeders"] > 0 else RED)
+            src_tag = f"{MAGENTA}[{item['source']}]{RESET}"
+            print(f" [{idx:2d}] {src_tag} {BOLD}{item['title']}{RESET}")
+            print(f"      Size: {YELLOW}{item['size']}{RESET} | Seeders: {s_color}{item['seeders']}{RESET} | Leechers: {DIM}{item['leechers']}{RESET}")
+        print()
+        sys.exit(0)
+
+    run_tui(sorted_results, initial_query=query_str)
+
+if __name__ == "__main__":
+    main()

@@ -481,9 +481,16 @@ func ensureAriaDaemon(destDir string) {
 	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/jsonrpc", RPCPort), bytes.NewReader(pingBytes))
 	req.Header.Set("Content-Type", "application/json")
 	if resp, err := client.Do(req); err == nil {
+		if resp.StatusCode == http.StatusOK {
+			resp.Body.Close()
+			return
+		}
 		resp.Body.Close()
-		return
 	}
+
+	// Kill any stale or unauthorized daemon on port
+	_ = exec.Command("pkill", "-9", "aria2c").Run()
+	time.Sleep(150 * time.Millisecond)
 
 	trackersArg := strings.Join(topTrackers, ",")
 	cmd := exec.Command("aria2c",
@@ -694,9 +701,9 @@ func downloadDashboard(item TorrentItem, destDir string) {
 	isPaused := false
 
 	for {
-		cols, lines, err := term.GetSize(fd)
+		cols, _, err := term.GetSize(fd)
 		if err != nil || cols <= 0 {
-			cols, lines = 80, 24
+			cols = 80
 		}
 
 		task := getCurrentTask()
@@ -784,8 +791,8 @@ func downloadDashboard(item TorrentItem, destDir string) {
 		if barWidth < 12 {
 			barWidth = 12
 		}
-		if barWidth > 42 {
-			barWidth = 42
+		if barWidth > 38 {
+			barWidth = 38
 		}
 
 		filled := int(float64(barWidth) * pct / 100.0)
@@ -793,24 +800,24 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			filled = barWidth
 		}
 		empty := barWidth - filled
+		if empty < 0 {
+			empty = 0
+		}
 
-		barDisplay := fmt.Sprintf("[%s%s%s%s%s%s] %s%s%5.1f%%%s", Bold, Cyan, strings.Repeat("█", filled), Reset, Dim, strings.Repeat("░", empty), Reset, Bold, White, pct, Reset)
+		fillStr := fmt.Sprintf("%s%s%s%s", Bold, Cyan, strings.Repeat("█", filled), Reset)
+		emptyStr := fmt.Sprintf("%s%s%s", Dim, strings.Repeat("░", empty), Reset)
+		barDisplay := fmt.Sprintf("[%s%s] %s%s%5.1f%%%s", fillStr, emptyStr, Bold, White, pct, Reset)
 		frame = append(frame, "\r"+barDisplay+ClearLine)
 		frame = append(frame, "\r"+ClearLine)
 
 		if isMetadataPhase {
-			frame = append(frame, "\r"+fmt.Sprintf("%sFinding best swarm seeds and resolving pieces...%s", Dim, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("%sFinding swarm seeds & resolving pieces...%s", Dim, Reset)+ClearLine)
 		} else {
 			metrics := fmt.Sprintf("%sSpeed:%s %s%-10s%s %sData:%s %s/%s  %sETA:%s %s%s%s",
 				Bold, Reset, Green, formatSpeed(speed), Reset,
 				Bold, Reset, formatBytes(completed), formatBytes(total),
 				Bold, Reset, Yellow, formatTime(etaSec), Reset)
 			frame = append(frame, "\r"+metrics+ClearLine)
-		}
-		frame = append(frame, "\r"+ClearLine)
-
-		for len(frame) < lines-3 {
-			frame = append(frame, "\r"+ClearLine)
 		}
 
 		if statusMsg != "" {
@@ -830,9 +837,10 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			if isPaused {
 				pLabel = "Resume"
 			}
-			controls = fmt.Sprintf("%s[p]%s %s  %s[c]%s Cancel  %s[b]%s Background  %s[q]%s Return", Bold, Reset, pLabel, Bold, Reset, Bold, Reset, Bold, Reset)
+			controls = fmt.Sprintf("%s[p]%s %s  %s[b]%s Background  %s[c]%s Cancel  %s[q]%s Return", Bold, Reset, pLabel, Bold, Reset, Bold, Reset, Bold, Reset)
 		}
 		frame = append(frame, "\r"+controls+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
 
 		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
 
@@ -875,7 +883,7 @@ func downloadDashboard(item TorrentItem, destDir string) {
 				fmt.Printf("\n%s✔ Download running in background!%s\r\n", Green, Reset)
 				fmt.Printf("%sSaved to: %s%s\r\n\r\n", Dim, destDir, Reset)
 				return
-			case "q", "quit":
+			case "q", "quit", "esc":
 				if gid != "" {
 					removeDownload(gid)
 				}
@@ -1214,42 +1222,37 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
 
 		k := readKey(fd)
-		switch k {
-		case "q", "QUIT":
+		switch strings.ToLower(k) {
+		case "q", "quit", "esc":
 			return
-		case "UP", "k":
+		case "up", "k":
 			if selectedIdx > 0 {
 				selectedIdx--
 			}
-		case "DOWN", "j":
+		case "down", "j":
 			if selectedIdx < totalItems-1 {
 				selectedIdx++
 			}
-		case "RIGHT", "l", "n":
+		case "right", "l", "n":
 			if currentPage < totalPages {
 				selectedIdx = startIdx + itemsPerPage
 				if selectedIdx >= totalItems {
 					selectedIdx = totalItems - 1
 				}
 			}
-		case "LEFT", "h", "p":
+		case "left", "h", "p":
 			if currentPage > 1 {
 				selectedIdx = startIdx - itemsPerPage
 				if selectedIdx < 0 {
 					selectedIdx = 0
 				}
 			}
-		case "t", "TAB":
+		case "t", "tab":
 			currentTierIdx = (currentTierIdx + 1) % len(tierFilters)
 			selectedIdx = 0
 		case "s":
 			currentSourceIdx = (currentSourceIdx + 1) % len(sourceFilters)
 			selectedIdx = 0
-		case "Q":
-			term.Restore(fd, oldState)
-			queueManager(destDir)
-			oldState, _ = term.MakeRaw(fd)
-			fmt.Print("\033[?25l" + ClearScrn)
 		case "/":
 			term.Restore(fd, oldState)
 			fmt.Print("\r\n\033[KEnter filter text (Enter to apply, empty to clear): ")

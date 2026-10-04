@@ -50,7 +50,7 @@ func init() {
 }
 
 const (
-	Version           = "1.2.0"
+	Version           = "1.3.0"
 	RPCPort           = 6800
 	RPCSecret         = "torq_secret_session"
 	StreamPort        = 3030
@@ -673,12 +673,52 @@ func ariaRPC(method string, params []interface{}) (json.RawMessage, error) {
 	return rpcResp.Result, nil
 }
 
+type TorqConfig struct {
+	MaxDownloadLimit string `json:"max_download_limit"`
+	MaxUploadLimit   string `json:"max_upload_limit"`
+}
+
+func getTorqConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "torq", "config.json")
+}
+
+func loadTorqConfig() TorqConfig {
+	cfg := TorqConfig{
+		MaxDownloadLimit: "0",
+		MaxUploadLimit:   "0",
+	}
+	p := getTorqConfigPath()
+	data, err := os.ReadFile(p)
+	if err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	if cfg.MaxDownloadLimit == "" {
+		cfg.MaxDownloadLimit = "0"
+	}
+	if cfg.MaxUploadLimit == "" {
+		cfg.MaxUploadLimit = "0"
+	}
+	return cfg
+}
+
+func saveTorqConfig(cfg TorqConfig) error {
+	p := getTorqConfigPath()
+	_ = os.MkdirAll(filepath.Dir(p), 0755)
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(p, data, 0644)
+}
+
 func ensureAriaDaemon(destDir string) {
 	if _, err := exec.LookPath("aria2c"); err != nil {
 		fmt.Printf("\r\n%s[!] 'aria2c' is not installed.%s\r\nPlease install it using: pkg install aria2 (or sudo apt install aria2)\r\n", Red, Reset)
 		return
 	}
 
+	cfg := loadTorqConfig()
 	trackersArg := strings.Join(topTrackers, ",")
 
 	// 1. Check if an aria2 daemon is already running and has DHT enabled
@@ -686,11 +726,13 @@ func ensureAriaDaemon(destDir string) {
 		var opts map[string]string
 		if json.Unmarshal(raw, &opts) == nil {
 			if opts["enable-dht"] == "true" {
-				// Daemon is alive and healthy, dynamically update directory and trackers
+				// Daemon is alive and healthy, dynamically update directory, trackers, and limits
 				_, _ = ariaRPC("aria2.changeGlobalOption", []interface{}{
 					map[string]string{
-						"dir":        destDir,
-						"bt-tracker": trackersArg,
+						"dir":                        destDir,
+						"bt-tracker":                 trackersArg,
+						"max-overall-download-limit": cfg.MaxDownloadLimit,
+						"max-overall-upload-limit":   cfg.MaxUploadLimit,
 					},
 				})
 				return
@@ -708,6 +750,8 @@ func ensureAriaDaemon(destDir string) {
 		fmt.Sprintf("--rpc-listen-port=%d", RPCPort),
 		fmt.Sprintf("--rpc-secret=%s", RPCSecret),
 		fmt.Sprintf("--dir=%s", destDir),
+		fmt.Sprintf("--max-overall-download-limit=%s", cfg.MaxDownloadLimit),
+		fmt.Sprintf("--max-overall-upload-limit=%s", cfg.MaxUploadLimit),
 		"--seed-time=0",
 		"--file-allocation=none",
 		"--bt-max-peers=120",
@@ -994,8 +1038,13 @@ func runDownloadLoop(initialGID, defaultTitle, srcLabel, destDir string, fd int)
 		if isMetadataPhase {
 			frame = append(frame, "\r"+fmt.Sprintf("%sFinding swarm seeds & resolving pieces...%s", Dim, Reset)+ClearLine)
 		} else {
-			metrics := fmt.Sprintf("%sSpeed:%s %s%-9s%s %sData:%s %s/%s  %sETA:%s %s%s%s",
-				Bold, Reset, Green, formatSpeed(speed), Reset,
+			cfg := loadTorqConfig()
+			capStr := ""
+			if cfg.MaxDownloadLimit != "0" {
+				capStr = fmt.Sprintf(" %s[Cap: %s]%s", Yellow, cfg.MaxDownloadLimit, Reset)
+			}
+			metrics := fmt.Sprintf("%sSpeed:%s %s%-9s%s%s %sData:%s %s/%s  %sETA:%s %s%s%s",
+				Bold, Reset, Green, formatSpeed(speed), Reset, capStr,
 				Bold, Reset, formatBytes(completed), formatBytes(total),
 				Bold, Reset, Yellow, formatTime(etaSec), Reset)
 			frame = append(frame, "\r"+metrics+ClearLine)
@@ -2143,6 +2192,128 @@ func resumeDownloads(target string) {
 	fmt.Printf("%sInvalid download index: %s%s\n", Red, target, Reset)
 }
 
+func parseSpeedLimit(s string) (string, error) {
+	s = strings.TrimSpace(strings.ToLower(s))
+	if s == "" || s == "0" || s == "none" || s == "off" || s == "unlimited" || s == "max" {
+		return "0", nil
+	}
+	s = strings.TrimSuffix(s, "/s")
+	s = strings.TrimSuffix(s, "ps")
+	s = strings.TrimSuffix(s, "b")
+	s = strings.TrimSuffix(s, "i")
+
+	if strings.HasSuffix(s, "k") {
+		val := strings.TrimSuffix(s, "k")
+		if _, err := strconv.ParseFloat(val, 64); err == nil {
+			return strings.ToUpper(val) + "K", nil
+		}
+	}
+	if strings.HasSuffix(s, "m") {
+		val := strings.TrimSuffix(s, "m")
+		if _, err := strconv.ParseFloat(val, 64); err == nil {
+			return strings.ToUpper(val) + "M", nil
+		}
+	}
+	if strings.HasSuffix(s, "g") {
+		val := strings.TrimSuffix(s, "g")
+		if _, err := strconv.ParseFloat(val, 64); err == nil {
+			return strings.ToUpper(val) + "G", nil
+		}
+	}
+	if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return s, nil
+	}
+	return "", fmt.Errorf("invalid speed limit '%s'. Examples: 2M, 500K, 0", s)
+}
+
+func formatSpeedBadge(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "0" {
+		return fmt.Sprintf("%sUnlimited%s (0)", Green, Reset)
+	}
+	if b, err := strconv.ParseInt(s, 10, 64); err == nil && b > 0 {
+		return fmt.Sprintf("%s%s%s", Yellow, formatSpeed(b), Reset)
+	}
+	return fmt.Sprintf("%s%s/s%s", Yellow, s, Reset)
+}
+
+func handleLimitCommand(downArg, upArg string) {
+	ensureAriaDaemon(getDownloadsDir())
+	cfg := loadTorqConfig()
+
+	// If no arguments provided, display current limit status
+	if downArg == "" && upArg == "" {
+		liveDown := cfg.MaxDownloadLimit
+		liveUp := cfg.MaxUploadLimit
+		if raw, err := ariaRPC("aria2.getGlobalOption", nil); err == nil {
+			var opts map[string]string
+			if json.Unmarshal(raw, &opts) == nil {
+				if d, ok := opts["max-overall-download-limit"]; ok && d != "" {
+					liveDown = d
+				}
+				if u, ok := opts["max-overall-upload-limit"]; ok && u != "" {
+					liveUp = u
+				}
+			}
+		}
+
+		fmt.Printf("\r\n%s%s⚡ TORQ BANDWIDTH LIMITER%s\r\n", Bold, Cyan, Reset)
+		fmt.Printf("%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\r\n", Dim, Reset)
+		fmt.Printf("  %sDownload Cap:%s  %s\r\n", Bold, Reset, formatSpeedBadge(liveDown))
+		fmt.Printf("  %sUpload Cap:  %s  %s\r\n", Bold, Reset, formatSpeedBadge(liveUp))
+		fmt.Printf("%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\r\n", Dim, Reset)
+		fmt.Printf(" %sUsage:%s\r\n", Bold, Reset)
+		fmt.Printf("   torq limit <speed>       %s(e.g., torq limit 2M, torq limit 500K)%s\r\n", Dim, Reset)
+		fmt.Printf("   torq limit <down> <up>   %s(e.g., torq limit 3M 500K)%s\r\n", Dim, Reset)
+		fmt.Printf("   torq limit 0             %s(Remove all caps / Full unlimited speed)%s\r\n\r\n", Dim, Reset)
+		return
+	}
+
+	parsedDown, err := parseSpeedLimit(downArg)
+	if err != nil {
+		fmt.Printf("\r\n%s✖ %v%s\r\n\r\n", Red, err, Reset)
+		return
+	}
+
+	parsedUp := cfg.MaxUploadLimit
+	if upArg != "" {
+		u, err := parseSpeedLimit(upArg)
+		if err != nil {
+			fmt.Printf("\r\n%s✖ %v%s\r\n\r\n", Red, err, Reset)
+			return
+		}
+		parsedUp = u
+	}
+
+	// Update live running aria2 daemon
+	changeOpts := map[string]string{
+		"max-overall-download-limit": parsedDown,
+		"max-overall-upload-limit":   parsedUp,
+	}
+	_, err = ariaRPC("aria2.changeGlobalOption", []interface{}{changeOpts})
+	if err != nil {
+		fmt.Printf("\r\n%s✖ Failed communicating with aria2 daemon: %v%s\r\n\r\n", Red, err, Reset)
+		return
+	}
+
+	// Persist to configuration
+	cfg.MaxDownloadLimit = parsedDown
+	cfg.MaxUploadLimit = parsedUp
+	_ = saveTorqConfig(cfg)
+
+	fmt.Printf("\r\n%s%s⚡ TORQ BANDWIDTH LIMITER UPDATED%s\r\n", Bold, Green, Reset)
+	fmt.Printf("%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\r\n", Dim, Reset)
+	fmt.Printf("  %s✔ Download Cap:%s  %s\r\n", Bold, Reset, formatSpeedBadge(parsedDown))
+	fmt.Printf("  %s✔ Upload Cap:  %s  %s\r\n", Bold, Reset, formatSpeedBadge(parsedUp))
+	fmt.Printf("%s━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━%s\r\n", Dim, Reset)
+	if parsedDown != "0" {
+		fmt.Printf(" Active and future background downloads will respect this limit.\r\n")
+		fmt.Printf(" %sTo remove limit anytime: torq limit 0%s\r\n\r\n", Dim, Reset)
+	} else {
+		fmt.Printf(" Speed limits removed. Downloading at maximum connection rate!\r\n\r\n")
+	}
+}
+
 func getTaskDisplayName(t AriaTask) string {
 	if t.Bittorrent != nil && t.Bittorrent.Info != nil && t.Bittorrent.Info.Name != "" {
 		return t.Bittorrent.Info.Name
@@ -2204,7 +2375,12 @@ func queueManager(destDir string) {
 		}
 
 		var frame []string
-		hdr := fmt.Sprintf("%s%s⚡ TORQ ACTIVE DOWNLOAD QUEUE%s %s───%s %s%d Active%s", Bold, Cyan, Reset, Dim, Reset, Yellow, totalItems, Reset)
+		cfg := loadTorqConfig()
+		capBadge := ""
+		if cfg.MaxDownloadLimit != "0" {
+			capBadge = fmt.Sprintf(" %s[Cap: %s]%s", Yellow, cfg.MaxDownloadLimit, Reset)
+		}
+		hdr := fmt.Sprintf("%s%s⚡ TORQ ACTIVE DOWNLOAD QUEUE%s%s %s───%s %s%d Active%s", Bold, Cyan, Reset, capBadge, Dim, Reset, Yellow, totalItems, Reset)
 		frame = append(frame, "\r"+hdr+ClearLine)
 		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 
@@ -2807,10 +2983,11 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Printf("%s⚡ torq %s - Lightweight, keyboard-driven multi-tracker media engine for your terminal%s\n\n", Bold, Version, Reset)
-		fmt.Println("Usage: torq [flags] [query | stream | queue | cancel | pause | resume]")
+		fmt.Println("Usage: torq [flags] [query | stream | queue | cancel | pause | resume | limit]")
 		fmt.Println("\nCommands:")
 		fmt.Println("  torq stream <query|magnet>  Stream video directly in Rex Player (Zero-Disk)")
 		fmt.Println("  torq queue                  View active downloads and recent completed media")
+		fmt.Println("  torq limit [speed]          Set or view download speed limit (e.g. 2M, 500K, 0)")
 		fmt.Println("  torq cancel [all | N]       Cancel active background download(s)")
 		fmt.Println("  torq pause  [all | N]       Pause active background download(s)")
 		fmt.Println("  torq resume [all | N]       Resume paused background download(s)")
@@ -2821,6 +2998,8 @@ func main() {
 		fmt.Println("  torq stream \"Interstellar\"")
 		fmt.Println("  torq stream \"magnet:?xt=...\"")
 		fmt.Println("  torq queue")
+		fmt.Println("  torq limit 2M")
+		fmt.Println("  torq limit 0")
 		fmt.Println("  torq cancel")
 		fmt.Println("  torq resume")
 		fmt.Println("  torq -q highest \"Oppenheimer\"")
@@ -2848,6 +3027,19 @@ func main() {
 	if firstWord == "stream" || firstWord == "play" {
 		target := strings.TrimSpace(strings.Join(args[1:], " "))
 		handleStreamCommand(target, *sourceFlag, *qualityFlag)
+		return
+	}
+
+	if firstWord == "limit" || firstWord == "throttle" || firstWord == "speed" {
+		downArg := ""
+		upArg := ""
+		if len(args) > 1 {
+			downArg = args[1]
+		}
+		if len(args) > 2 {
+			upArg = args[2]
+		}
+		handleLimitCommand(downArg, upArg)
 		return
 	}
 

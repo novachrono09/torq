@@ -933,6 +933,24 @@ func queueManager(destDir string) {
 	}
 }
 
+func fetchBinary(targetURL string) ([]byte, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Linux; Android 14) torq-updater")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d from %s", resp.StatusCode, targetURL)
+	}
+	return io.ReadAll(resp.Body)
+}
+
 func selfUpdate() {
 	fmt.Printf("%sChecking for updates from GitHub...%s\n", Cyan, Reset)
 	targetPath, err := os.Executable()
@@ -950,27 +968,20 @@ func selfUpdate() {
 	}
 
 	downloadURL := fmt.Sprintf("https://github.com/novachrono09/torq/releases/latest/download/torq-%s-%s", goos, arch)
-	resp, err := http.Get(downloadURL)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		// Fallback to latest tag or raw source build
+	newCode, err := fetchBinary(downloadURL)
+	if err != nil {
+		// Fallback to current tag
 		downloadURL = fmt.Sprintf("https://github.com/novachrono09/torq/releases/download/v%s/torq-%s-%s", Version, goos, arch)
-		resp, err = http.Get(downloadURL)
+		newCode, err = fetchBinary(downloadURL)
 	}
-	if err != nil || resp.StatusCode != http.StatusOK {
-		fmt.Printf("%sUpdate failed: release binary not reachable at %s%s\n", Red, downloadURL, Reset)
-		return
-	}
-	defer resp.Body.Close()
-
-	newCode, err := io.ReadAll(resp.Body)
 	if err != nil || len(newCode) == 0 {
-		fmt.Printf("%sUpdate failed: empty file received.%s\n", Red, Reset)
+		fmt.Printf("%sUpdate failed: %v%s\n", Red, err, Reset)
 		return
 	}
 
 	tmpFile := targetPath + ".tmp"
 	if err := os.WriteFile(tmpFile, newCode, 0755); err != nil {
-		fmt.Printf("%sUpdate failed: %v%s\n", Red, err, Reset)
+		fmt.Printf("%sUpdate failed writing temp file: %v%s\n", Red, err, Reset)
 		return
 	}
 	if err := os.Rename(tmpFile, targetPath); err != nil {

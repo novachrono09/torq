@@ -1262,7 +1262,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 			oldState, _ = term.MakeRaw(fd)
 			fmt.Print("\033[?25l" + ClearScrn)
 			selectedIdx = 0
-		case "m", "M":
+		case "m":
 			if totalItems > 0 {
 				item := filtered[selectedIdx]
 				if copyToClipboard(item.Magnet) {
@@ -1279,7 +1279,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 					statusMsg = fmt.Sprintf("Magnet: %s...", shortMag)
 				}
 			}
-		case "ENTER", "d", "D":
+		case "enter", "d":
 			if totalItems > 0 {
 				item := filtered[selectedIdx]
 				hasSpace, freeB := checkDiskSpace(destDir, item.RawSize)
@@ -1301,7 +1301,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 				term.Restore(fd, oldState)
 				downloadDashboard(item, destDir)
 				oldState, _ = term.MakeRaw(fd)
-				fmt.Print(ClearScrn)
+				fmt.Print("\033[?25l" + ClearScrn)
 			}
 		}
 	}

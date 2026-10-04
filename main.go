@@ -919,6 +919,78 @@ func downloadDashboard(item TorrentItem, destDir string) {
 	}
 }
 
+func cancelDownloads(target string) {
+	ensureAriaDaemon(getDownloadsDir())
+	active := getActiveTasks()
+	if len(active) == 0 {
+		fmt.Printf("%sNo active or waiting downloads to cancel.%s\n", Yellow, Reset)
+		return
+	}
+	if target == "all" || target == "" {
+		for _, t := range active {
+			_, _ = ariaRPC("aria2.forceRemove", []interface{}{t.GID})
+			_, _ = ariaRPC("aria2.remove", []interface{}{t.GID})
+		}
+		_, _ = ariaRPC("aria2.purgeDownloadResult", nil)
+		fmt.Printf("%s✔ Cancelled %d active download(s).%s\n", Green, len(active), Reset)
+		return
+	}
+	num, err := strconv.Atoi(target)
+	if err == nil && num >= 1 && num <= len(active) {
+		t := active[num-1]
+		_, _ = ariaRPC("aria2.forceRemove", []interface{}{t.GID})
+		_, _ = ariaRPC("aria2.remove", []interface{}{t.GID})
+		_, _ = ariaRPC("aria2.purgeDownloadResult", nil)
+		fmt.Printf("%s✔ Cancelled download #%d.%s\n", Green, num, Reset)
+		return
+	}
+	fmt.Printf("%sInvalid download index: %s%s\n", Red, target, Reset)
+}
+
+func pauseDownloads(target string) {
+	ensureAriaDaemon(getDownloadsDir())
+	active := getActiveTasks()
+	if len(active) == 0 {
+		fmt.Printf("%sNo active downloads to pause.%s\n", Yellow, Reset)
+		return
+	}
+	if target == "all" || target == "" {
+		_, _ = ariaRPC("aria2.pauseAll", nil)
+		fmt.Printf("%s✔ Paused all active downloads.%s\n", Green, Reset)
+		return
+	}
+	num, err := strconv.Atoi(target)
+	if err == nil && num >= 1 && num <= len(active) {
+		t := active[num-1]
+		_, _ = ariaRPC("aria2.pause", []interface{}{t.GID})
+		fmt.Printf("%s✔ Paused download #%d.%s\n", Green, num, Reset)
+		return
+	}
+	fmt.Printf("%sInvalid download index: %s%s\n", Red, target, Reset)
+}
+
+func resumeDownloads(target string) {
+	ensureAriaDaemon(getDownloadsDir())
+	active := getActiveTasks()
+	if len(active) == 0 {
+		fmt.Printf("%sNo downloads to resume.%s\n", Yellow, Reset)
+		return
+	}
+	if target == "all" || target == "" {
+		_, _ = ariaRPC("aria2.unpauseAll", nil)
+		fmt.Printf("%s✔ Resumed all downloads.%s\n", Green, Reset)
+		return
+	}
+	num, err := strconv.Atoi(target)
+	if err == nil && num >= 1 && num <= len(active) {
+		t := active[num-1]
+		_, _ = ariaRPC("aria2.unpause", []interface{}{t.GID})
+		fmt.Printf("%s✔ Resumed download #%d.%s\n", Green, num, Reset)
+		return
+	}
+	fmt.Printf("%sInvalid download index: %s%s\n", Red, target, Reset)
+}
+
 func queueManager(destDir string) {
 	ensureAriaDaemon(destDir)
 	fmt.Print(ClearScrn)
@@ -1015,6 +1087,9 @@ func queueManager(destDir string) {
 	if maxNum > 12 {
 		maxNum = 12
 	}
+	if len(activeTasks) > 0 {
+		fmt.Printf("%s[c]%s Cancel All  %s[p]%s Pause All  %s[r]%s Resume All\n", Bold, Reset, Bold, Reset, Bold, Reset)
+	}
 	fmt.Printf("%s[1-%d]%s Open File  %s[o]%s Open Folder  %s[q]%s Return\n\n", Bold, maxNum, Reset, Bold, Reset, Bold, Reset)
 
 	fmt.Printf("%sAction > %s", Bold, Reset)
@@ -1022,11 +1097,28 @@ func queueManager(destDir string) {
 	choice, _ := reader.ReadString('\n')
 	choice = strings.TrimSpace(strings.ToLower(choice))
 
-	if choice == "o" {
+	switch {
+	case choice == "q":
+		return
+	case choice == "o":
 		openPath(destDir)
-	} else if num, err := strconv.Atoi(choice); err == nil && num >= 1 && num <= len(files) {
-		chosenFile := filepath.Join(destDir, files[num-1].name)
-		openPath(chosenFile)
+	case choice == "c" || choice == "cancel" || choice == "ca" || choice == "cancel all":
+		cancelDownloads("all")
+	case choice == "p" || choice == "pause" || choice == "pa" || choice == "pause all":
+		pauseDownloads("all")
+	case choice == "r" || choice == "resume" || choice == "ra" || choice == "resume all":
+		resumeDownloads("all")
+	case strings.HasPrefix(choice, "c"):
+		cancelDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "c")))
+	case strings.HasPrefix(choice, "p"):
+		pauseDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "p")))
+	case strings.HasPrefix(choice, "r"):
+		resumeDownloads(strings.TrimSpace(strings.TrimPrefix(choice, "r")))
+	default:
+		if num, err := strconv.Atoi(choice); err == nil && num >= 1 && num <= len(files) {
+			chosenFile := filepath.Join(destDir, files[num-1].name)
+			openPath(chosenFile)
+		}
 	}
 }
 
@@ -1370,12 +1462,19 @@ func main() {
 
 	flag.Usage = func() {
 		fmt.Printf("%s⚡ torq %s - Lightweight, keyboard-driven multi-tracker media engine for your terminal%s\n\n", Bold, Version, Reset)
-		fmt.Println("Usage: torq [flags] [query | queue]")
+		fmt.Println("Usage: torq [flags] [query | queue | cancel | pause | resume]")
+		fmt.Println("\nCommands:")
+		fmt.Println("  torq queue             View active downloads and recent completed media")
+		fmt.Println("  torq cancel [all | N]  Cancel active background download(s)")
+		fmt.Println("  torq pause  [all | N]  Pause active background download(s)")
+		fmt.Println("  torq resume [all | N]  Resume paused background download(s)")
 		fmt.Println("\nFlags:")
 		flag.PrintDefaults()
 		fmt.Println("\nExamples:")
 		fmt.Println("  torq \"Doraemon\"")
 		fmt.Println("  torq queue")
+		fmt.Println("  torq cancel")
+		fmt.Println("  torq resume")
 		fmt.Println("  torq -q highest \"Oppenheimer\"")
 		fmt.Println("  torq --update")
 	}
@@ -1393,6 +1492,38 @@ func main() {
 	}
 
 	args := flag.Args()
+	firstWord := ""
+	if len(args) > 0 {
+		firstWord = strings.ToLower(args[0])
+	}
+
+	if firstWord == "cancel" || firstWord == "stop" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		cancelDownloads(target)
+		return
+	}
+
+	if firstWord == "pause" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		pauseDownloads(target)
+		return
+	}
+
+	if firstWord == "resume" || firstWord == "unpause" {
+		target := "all"
+		if len(args) > 1 {
+			target = strings.ToLower(args[1])
+		}
+		resumeDownloads(target)
+		return
+	}
+
 	queryStr := strings.TrimSpace(strings.Join(args, " "))
 
 	if strings.ToLower(queryStr) == "queue" || strings.ToLower(queryStr) == "q" {

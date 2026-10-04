@@ -372,6 +372,149 @@ func searchNyaa(ctx context.Context, query string) []TorrentItem {
 	return results
 }
 
+type YTSResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		MovieCount int `json:"movie_count"`
+		Movies     []struct {
+			Title    string `json:"title"`
+			Year     int    `json:"year"`
+			Torrents []struct {
+				Hash      string `json:"hash"`
+				Quality   string `json:"quality"`
+				Type      string `json:"type"`
+				Seeds     int    `json:"seeds"`
+				Peers     int    `json:"peers"`
+				Size      string `json:"size"`
+				SizeBytes int64  `json:"size_bytes"`
+			} `json:"torrents"`
+		} `json:"movies"`
+	} `json:"data"`
+}
+
+func searchYTS(ctx context.Context, query string) []TorrentItem {
+	mirrors := []string{
+		"https://yts.lt/api/v2/list_movies.json?query_term=",
+		"https://yts.bz/api/v2/list_movies.json?query_term=",
+	}
+
+	client := &http.Client{Timeout: 8 * time.Second}
+
+	for _, endpoint := range mirrors {
+		target := endpoint + url.QueryEscape(query)
+		req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
+
+		resp, err := client.Do(req)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			continue
+		}
+
+		var yr YTSResponse
+		err = json.NewDecoder(resp.Body).Decode(&yr)
+		resp.Body.Close()
+		if err != nil || len(yr.Data.Movies) == 0 {
+			continue
+		}
+
+		var results []TorrentItem
+		for _, m := range yr.Data.Movies {
+			for _, t := range m.Torrents {
+				title := fmt.Sprintf("%s (%d) [%s] [%s]", m.Title, m.Year, t.Quality, strings.ToUpper(t.Type))
+				tier := detectQualityTier(title)
+				if strings.Contains(strings.ToLower(t.Quality), "2160p") || strings.Contains(strings.ToLower(t.Quality), "4k") {
+					tier = "Highest Quality (4K / UHD / Remux)"
+				} else if strings.Contains(strings.ToLower(t.Quality), "1080p") {
+					tier = "High Quality (1080p / FHD / BD)"
+				} else if strings.Contains(strings.ToLower(t.Quality), "720p") {
+					tier = "Medium Quality (720p / HD)"
+				}
+
+				baseMag := fmt.Sprintf("magnet:?xt=urn:btih:%s&dn=%s", t.Hash, url.QueryEscape(title))
+				mag := injectTrackers(baseMag, title)
+
+				results = append(results, TorrentItem{
+					Title:    title,
+					Source:   "YTS",
+					Seeders:  t.Seeds,
+					Leechers: t.Peers,
+					Size:     t.Size,
+					RawSize:  t.SizeBytes,
+					Category: "Movies",
+					Tier:     tier,
+					Magnet:   mag,
+				})
+			}
+		}
+		if len(results) > 0 {
+			return results
+		}
+	}
+	return nil
+}
+
+type AnimeToshoItem struct {
+	ID        int64  `json:"id"`
+	Title     string `json:"title"`
+	MagnetURI string `json:"magnet_uri"`
+	Seeders   int    `json:"seeders"`
+	Leechers  int    `json:"leechers"`
+	TotalSize int64  `json:"total_size"`
+}
+
+func searchAnimeTosho(ctx context.Context, query string) []TorrentItem {
+	target := "https://feed.animetosho.org/json?q=" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, "GET", target, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0")
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		if resp != nil {
+			resp.Body.Close()
+		}
+		return nil
+	}
+	defer resp.Body.Close()
+
+	var items []AnimeToshoItem
+	if err := json.NewDecoder(resp.Body).Decode(&items); err != nil {
+		return nil
+	}
+
+	var results []TorrentItem
+	for _, it := range items {
+		if it.Title == "" || it.MagnetURI == "" {
+			continue
+		}
+		title := html.UnescapeString(it.Title)
+		tier := detectQualityTier(title)
+		mag := injectTrackers(it.MagnetURI, title)
+
+		results = append(results, TorrentItem{
+			Title:    title,
+			Source:   "AnimeTosho",
+			Seeders:  it.Seeders,
+			Leechers: it.Leechers,
+			Size:     formatBytes(it.TotalSize),
+			RawSize:  it.TotalSize,
+			Category: "Anime",
+			Tier:     tier,
+			Magnet:   mag,
+		})
+	}
+	return results
+}
+
 func getDownloadsDir() string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{
@@ -1296,7 +1439,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 
 	tierFilters := append([]string{"ALL"}, qualityOrder...)
 	currentTierIdx := 0
-	sourceFilters := []string{"ALL", "ThePirateBay", "Nyaa"}
+	sourceFilters := []string{"ALL", "ThePirateBay", "YTS", "Nyaa", "AnimeTosho"}
 	currentSourceIdx := 0
 	searchFilter := ""
 
@@ -1386,8 +1529,11 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 			qDisp = qDisp[:16]
 		}
 		srcLabel := targetSource
-		if srcLabel == "ThePirateBay" {
+		switch srcLabel {
+		case "ThePirateBay":
 			srcLabel = "TPB"
+		case "AnimeTosho":
+			srcLabel = "Tosho"
 		}
 		hdr := fmt.Sprintf("%s%s⚡ TORQ%s | %s%s%s%s | %s%s%s | %s%s%s | Pg: %s%d/%d%s",
 			Bold, Cyan, Reset,
@@ -1445,8 +1591,11 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 				}
 
 				itemSrc := it.Source
-				if itemSrc == "ThePirateBay" {
+				switch itemSrc {
+				case "ThePirateBay":
 					itemSrc = "TPB"
+				case "AnimeTosho":
+					itemSrc = "Tosho"
 				}
 
 				line2 := fmt.Sprintf("       %s[%s]%s  %s%s%s  ▲ %s%d%s  ▼ %s%d%s",
@@ -1557,7 +1706,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 }
 
 func main() {
-	sourceFlag := flag.String("s", "all", "Tracker source to query (all, tpb, nyaa)")
+	sourceFlag := flag.String("s", "all", "Tracker source to query (all, tpb, yts, nyaa, tosho)")
 	qualityFlag := flag.String("q", "all", "Filter by quality section (highest, high, medium, low)")
 	listFlag := flag.Bool("l", false, "List search results with sections and exit")
 	magnetFlag := flag.Bool("m", false, "Print magnet link of top result and exit")
@@ -1666,11 +1815,22 @@ func main() {
 	var mu sync.Mutex
 
 	src := strings.ToLower(*sourceFlag)
-	if src == "all" || src == "tpb" {
+	if src == "all" || src == "tpb" || src == "thepiratebay" {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			items := searchTPB(ctx, queryStr)
+			mu.Lock()
+			rawResults = append(rawResults, items...)
+			mu.Unlock()
+		}()
+	}
+
+	if src == "all" || src == "yts" || src == "yify" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			items := searchYTS(ctx, queryStr)
 			mu.Lock()
 			rawResults = append(rawResults, items...)
 			mu.Unlock()
@@ -1688,7 +1848,40 @@ func main() {
 		}()
 	}
 
+	if src == "all" || src == "tosho" || src == "animetosho" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			items := searchAnimeTosho(ctx, queryStr)
+			mu.Lock()
+			rawResults = append(rawResults, items...)
+			mu.Unlock()
+		}()
+	}
+
 	wg.Wait()
+
+	// Deduplicate items with identical info_hashes across multi-trackers
+	seenHashes := make(map[string]bool)
+	var dedupedResults []TorrentItem
+	for _, it := range rawResults {
+		key := it.Magnet
+		if idx := strings.Index(key, "xt=urn:btih:"); idx != -1 {
+			hashPart := key[idx+12:]
+			if ampersand := strings.Index(hashPart, "&"); ampersand != -1 {
+				hashPart = hashPart[:ampersand]
+			}
+			key = strings.ToLower(hashPart)
+		}
+		if key != "" && seenHashes[key] {
+			continue
+		}
+		if key != "" {
+			seenHashes[key] = true
+		}
+		dedupedResults = append(dedupedResults, it)
+	}
+	rawResults = dedupedResults
 
 	if len(rawResults) == 0 {
 		fmt.Printf("%sNo results found for '%s'.%s\n", Yellow, queryStr, Reset)
@@ -1772,7 +1965,14 @@ func main() {
 			} else if it.Seeders > 0 {
 				sColor = Yellow
 			}
-			srcTag := fmt.Sprintf("%s[%s]%s", Magenta, it.Source, Reset)
+			srcDisp := it.Source
+			switch srcDisp {
+			case "ThePirateBay":
+				srcDisp = "TPB"
+			case "AnimeTosho":
+				srcDisp = "Tosho"
+			}
+			srcTag := fmt.Sprintf("%s[%s]%s", Magenta, srcDisp, Reset)
 			fmt.Printf(" [%2d] %s %s%s%s\n", idx+1, srcTag, Bold, it.Title, Reset)
 			fmt.Printf("      Size: %s%s%s | Seeders: %s%d%s | Leechers: %s%d%s\n",
 				Yellow, it.Size, Reset, sColor, it.Seeders, Reset, Dim, it.Leechers, Reset)

@@ -1,0 +1,93 @@
+name: Build and Release torq
+
+on:
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Multi-Arch Standalone Binaries
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm64
+            target: torq-linux-arm64
+          - goos: linux
+            goarch: amd64
+            target: torq-linux-amd64
+          - goos: linux
+            goarch: arm
+            goarm: 7
+            target: torq-linux-armv7
+          - goos: darwin
+            goarch: arm64
+            target: torq-darwin-arm64
+          - goos: darwin
+            goarch: amd64
+            target: torq-darwin-amd64
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Build Binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: 0
+        run: |
+          go build -trimpath -ldflags="-s -w -X main.Version=${{ github.ref_name }}" -o dist/${{ matrix.target }} main.go
+          chmod +x dist/${{ matrix.target }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ matrix.target }}
+
+  release:
+    name: Create Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare Release Assets
+        run: |
+          mkdir -p release-assets
+          cp dist/torq-linux-arm64/torq-linux-arm64 release-assets/
+          cp dist/torq-linux-amd64/torq-linux-amd64 release-assets/
+          cp dist/torq-linux-armv7/torq-linux-armv7 release-assets/
+          cp dist/torq-darwin-arm64/torq-darwin-arm64 release-assets/
+          cp dist/torq-darwin-amd64/torq-darwin-amd64 release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true

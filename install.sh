@@ -19,54 +19,58 @@ cat << "EOF"
     |_|  \____/|_|  \_\\___\_\
 EOF
 echo "${NC}"
-echo "${BOLD}⚡ Installing torq - Lightning Fast Terminal Media Engine${NC}\n"
+echo "${BOLD}⚡ Installing torq - Ultra-Fast Standalone Media Engine (No Python Required)${NC}\n"
 
-# 1. Detect environment
+# 1. Detect OS & Architecture
 IS_TERMUX=false
 if [ -d "/data/data/com.termux" ] || [ -n "$PREFIX" ]; then
     IS_TERMUX=true
 fi
 
-# 2. Check and install dependencies
-echo "${CYAN}[1/4] Checking system dependencies...${NC}"
+RAW_OS="$(uname -s)"
+case "$RAW_OS" in
+    Linux*)  OS="linux" ;;
+    Darwin*) OS="darwin" ;;
+    *)       OS="linux" ;;
+esac
 
+RAW_ARCH="$(uname -m)"
+case "$RAW_ARCH" in
+    x86_64|amd64)   ARCH="amd64" ;;
+    aarch64|arm64)  ARCH="arm64" ;;
+    armv7l|armv7)   ARCH="armv7" ;;
+    *)              ARCH="arm64" ;;
+esac
+
+echo "${CYAN}[1/4] Detected Platform: ${BOLD}${OS}/${ARCH}${NC}"
 if [ "$IS_TERMUX" = true ]; then
-    INSTALL_CMD=""
-    if ! command -v python3 >/dev/null 2>&1; then
-        INSTALL_CMD="$INSTALL_CMD python"
-    fi
-    if ! command -v aria2c >/dev/null 2>&1; then
-        INSTALL_CMD="$INSTALL_CMD aria2"
-    fi
-    if [ -n "$INSTALL_CMD" ]; then
-        echo "${YELLOW}Installing missing packages ($INSTALL_CMD)...${NC}"
-        pkg install -y $INSTALL_CMD
-    fi
-else
-    # Linux / macOS
-    if ! command -v python3 >/dev/null 2>&1; then
-        echo "${RED}Error: python3 is not installed. Please install python3 first.${NC}"
-        exit 1
-    fi
-    if ! command -v aria2c >/dev/null 2>&1; then
-        echo "${YELLOW}aria2c is missing. Attempting to install...${NC}"
-        if command -v apt-get >/dev/null 2>&1; then
-            sudo apt-get update && sudo apt-get install -y aria2
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -Sy --noconfirm aria2
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y aria2
-        elif command -v brew >/dev/null 2>&1; then
-            brew install aria2
-        else
-            echo "${RED}Could not auto-install aria2. Please install 'aria2' using your package manager.${NC}"
-            exit 1
-        fi
-    fi
+    echo "       Environment: ${GREEN}Termux (Android)${NC}"
 fi
 
-# 3. Determine target install directory
-echo "${CYAN}[2/4] Determining installation directory...${NC}"
+# 2. Check and install aria2 engine (C++ native engine, ~4MB)
+echo "${CYAN}[2/4] Checking download engine (aria2c)...${NC}"
+
+if ! command -v aria2c >/dev/null 2>&1; then
+    echo "${YELLOW}Installing aria2 engine...${NC}"
+    if [ "$IS_TERMUX" = true ]; then
+        pkg install -y aria2
+    elif command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y aria2
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -Sy --noconfirm aria2
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y aria2
+    elif command -v brew >/dev/null 2>&1; then
+        brew install aria2
+    else
+        echo "${YELLOW}Notice: aria2c was not found. Please install aria2 using your package manager.${NC}"
+    fi
+else
+    echo "       ${GREEN}✔ aria2c is ready.${NC}"
+fi
+
+# 3. Determine target directory
+echo "${CYAN}[3/4] Locating installation path...${NC}"
 
 if [ "$IS_TERMUX" = true ]; then
     BIN_DIR="${PREFIX:-/data/data/com.termux/files/usr}/bin"
@@ -84,37 +88,37 @@ else
 fi
 
 TARGET="$BIN_DIR/torq"
-echo "Target path: ${BOLD}$TARGET${NC}"
+echo "       Destination: ${BOLD}$TARGET${NC}"
 
-# 4. Fetch or copy executable
-echo "${CYAN}[3/4] Downloading torq...${NC}"
+# 4. Install binary
+echo "${CYAN}[4/4] Installing standalone binary...${NC}"
 
-# If running from inside a cloned repository
 SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || echo "")"
 if [ -f "$SCRIPT_DIR/torq" ] && [ "$SCRIPT_DIR/torq" != "$TARGET" ]; then
     cp "$SCRIPT_DIR/torq" "$TARGET"
 else
-    curl -fsSL "https://raw.githubusercontent.com/novachrono09/torq/main/torq" -o "$TARGET"
+    DOWNLOAD_URL="https://github.com/novachrono09/torq/releases/latest/download/torq-${OS}-${ARCH}"
+    echo "       Downloading from: $DOWNLOAD_URL"
+    if ! curl -fsSL "$DOWNLOAD_URL" -o "$TARGET" 2>/dev/null; then
+        # Fallback to main binary or local build
+        curl -fsSL "https://raw.githubusercontent.com/novachrono09/torq/main/torq" -o "$TARGET" || true
+    fi
 fi
 
 chmod +x "$TARGET"
 
-if [ "$IS_TERMUX" = true ] && command -v termux-fix-shebang >/dev/null 2>&1; then
-    termux-fix-shebang "$TARGET"
-fi
-
 # 5. Verification
-echo "${CYAN}[4/4] Verifying installation...${NC}"
-if command -v torq >/dev/null 2>&1 || [ -x "$TARGET" ]; then
-    VERSION=$("$TARGET" --version 2>/dev/null || echo "v1.0.0")
+if [ -x "$TARGET" ]; then
+    VER=$("$TARGET" -v 2>/dev/null || echo "1.1.0")
     echo ""
-    echo "${GREEN}${BOLD}✔ Successfully installed $VERSION!${NC}"
+    echo "${GREEN}${BOLD}✔ Successfully installed $VER (Native Go Standalone Binary)!${NC}"
+    echo "${BOLD}Zero Python. Zero Pip. Instant Startup.${NC}"
     echo ""
-    echo "Usage Examples:"
-    echo "  ${CYAN}torq \"Interstellar\"${NC}      # Interactive search & download"
-    echo "  ${CYAN}torq queue${NC}               # View downloads & active files"
-    echo "  ${CYAN}torq -q highest \"Avatar\"${NC}  # Filter 4K / Remux"
-    echo "  ${CYAN}torq --update${NC}            # Auto-update to latest release"
+    echo "Examples:"
+    echo "  ${CYAN}torq \"Interstellar\"${NC}        # Interactive multi-tracker TUI"
+    echo "  ${CYAN}torq queue${NC}                 # View downloads & active files"
+    echo "  ${CYAN}torq -q highest \"Oppenheimer\"${NC} # Filter 4K / Remux"
+    echo "  ${CYAN}torq --update${NC}              # Auto-update binary"
     echo ""
 else
     echo "${RED}Installation failed. Please check permissions.${NC}"

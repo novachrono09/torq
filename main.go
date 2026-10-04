@@ -620,6 +620,17 @@ func hasKeyInput(stdinFd int, timeout time.Duration) bool {
 	return err == nil && n > 0 && readFds.IsSet(stdinFd)
 }
 
+func truncateRunes(s string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) > maxRunes {
+		return string(r[:maxRunes])
+	}
+	return s
+}
+
 func readKey(stdinFd int) string {
 	buf := make([]byte, 1)
 	n, err := os.Stdin.Read(buf)
@@ -628,27 +639,28 @@ func readKey(stdinFd int) string {
 	}
 	b := buf[0]
 	if b == 0x1b { // ESC
-		time.Sleep(50 * time.Millisecond)
-		seq := make([]byte, 8)
+		seq := make([]byte, 16)
 		_ = unix.SetNonblock(stdinFd, true)
+		time.Sleep(30 * time.Millisecond)
 		nSeq, _ := os.Stdin.Read(seq)
 		_ = unix.SetNonblock(stdinFd, false)
 		if nSeq == 0 {
 			return "ESC"
 		}
 		s := string(seq[:nSeq])
-		switch s {
-		case "[A", "OA":
+		if strings.HasPrefix(s, "[A") || strings.HasPrefix(s, "OA") {
 			return "UP"
-		case "[B", "OB":
-			return "DOWN"
-		case "[C", "OC":
-			return "RIGHT"
-		case "[D", "OD":
-			return "LEFT"
-		default:
-			return "ESC_" + s
 		}
+		if strings.HasPrefix(s, "[B") || strings.HasPrefix(s, "OB") {
+			return "DOWN"
+		}
+		if strings.HasPrefix(s, "[C") || strings.HasPrefix(s, "OC") {
+			return "RIGHT"
+		}
+		if strings.HasPrefix(s, "[D") || strings.HasPrefix(s, "OD") {
+			return "LEFT"
+		}
+		return "ESC"
 	}
 	switch b {
 	case '\r', '\n':
@@ -676,7 +688,7 @@ func downloadDashboard(item TorrentItem, destDir string) {
 		defer term.Restore(fd, oldState)
 	}
 	fmt.Print("\033[?25l" + ClearScrn)
-	defer fmt.Print("\033[?25h\n")
+	defer fmt.Print("\033[?25h\r\n")
 
 	statusMsg := ""
 	isPaused := false
@@ -727,35 +739,32 @@ func downloadDashboard(item TorrentItem, destDir string) {
 		}
 
 		var frame []string
-		frame = append(frame, MoveTop)
 
-		hdr := fmt.Sprintf("%s%s⚡ TORQ DOWNLOAD MANAGER%s %s───%s %s%s[%s]%s", Bold, Cyan, Reset, Dim, Reset, Bold, Magenta, item.Source, Reset)
-		if len(hdr) > cols+40 {
-			hdr = hdr[:cols+40]
-		}
-		frame = append(frame, hdr+ClearLine)
-
-		divLen := cols - 1
+		divLen := cols - 2
 		if divLen > 78 {
 			divLen = 78
 		}
 		if divLen < 1 {
 			divLen = 1
 		}
-		frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 
-		fnDisp := fileName
-		if len(fnDisp) > cols-8 && cols > 8 {
-			fnDisp = fnDisp[:cols-8]
+		srcLabel := item.Source
+		if srcLabel == "ThePirateBay" {
+			srcLabel = "TPB"
 		}
-		frame = append(frame, fmt.Sprintf("%sFile:%s %s%s%s", Bold, Reset, White, fnDisp, Reset)+ClearLine)
-		frame = append(frame, fmt.Sprintf("%sPath:%s %s%s%s", Bold, Reset, Dim, destDir, Reset)+ClearLine)
-		frame = append(frame, ClearLine)
+		hdr := fmt.Sprintf("%s%s⚡ TORQ DOWNLOAD MANAGER%s %s───%s %s%s[%s]%s", Bold, Cyan, Reset, Dim, Reset, Bold, Magenta, srcLabel, Reset)
+		frame = append(frame, "\r"+hdr+ClearLine)
+		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+
+		fnDisp := truncateRunes(fileName, cols-8)
+		frame = append(frame, "\r"+fmt.Sprintf("%sFile:%s %s%s%s", Bold, Reset, White, fnDisp, Reset)+ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf("%sPath:%s %s%s%s", Bold, Reset, Dim, truncateRunes(destDir, cols-8), Reset)+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
 
 		badge := ""
 		switch {
 		case isMetadataPhase:
-			badge = fmt.Sprintf("%s◐ CONNECTING TO PEERS & FETCHING METADATA...%s", Magenta, Reset)
+			badge = fmt.Sprintf("%s◐ CONNECTING & FETCHING METADATA...%s", Magenta, Reset)
 		case statusText == "active":
 			badge = fmt.Sprintf("%s● DOWNLOADING%s", Green, Reset)
 		case statusText == "paused":
@@ -768,15 +777,15 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			badge = fmt.Sprintf("%s● %s%s", Yellow, strings.ToUpper(statusText), Reset)
 		}
 
-		frame = append(frame, fmt.Sprintf("%sStatus:%s %s   %sPeers:%s %d connected (%d seeds)", Bold, Reset, badge, Bold, Reset, conns, seeders)+ClearLine)
-		frame = append(frame, ClearLine)
+		frame = append(frame, "\r"+fmt.Sprintf("%sStatus:%s %s   %sPeers:%s %d (%d seeds)", Bold, Reset, badge, Bold, Reset, conns, seeders)+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
 
-		barWidth := cols - 30
-		if barWidth < 15 {
-			barWidth = 15
+		barWidth := cols - 20
+		if barWidth < 12 {
+			barWidth = 12
 		}
-		if barWidth > 48 {
-			barWidth = 48
+		if barWidth > 42 {
+			barWidth = 42
 		}
 
 		filled := int(float64(barWidth) * pct / 100.0)
@@ -786,35 +795,34 @@ func downloadDashboard(item TorrentItem, destDir string) {
 		empty := barWidth - filled
 
 		barDisplay := fmt.Sprintf("[%s%s%s%s%s%s] %s%s%5.1f%%%s", Bold, Cyan, strings.Repeat("█", filled), Reset, Dim, strings.Repeat("░", empty), Reset, Bold, White, pct, Reset)
-		frame = append(frame, barDisplay+ClearLine)
-		frame = append(frame, ClearLine)
+		frame = append(frame, "\r"+barDisplay+ClearLine)
+		frame = append(frame, "\r"+ClearLine)
 
 		if isMetadataPhase {
-			frame = append(frame, fmt.Sprintf("%sFinding best swarm seeds and resolving file pieces...%s", Dim, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("%sFinding best swarm seeds and resolving pieces...%s", Dim, Reset)+ClearLine)
 		} else {
-			metrics := fmt.Sprintf("%sSpeed:%s %s%-12s%s %sData:%s %s / %s   %sETA:%s %s%s%s",
+			metrics := fmt.Sprintf("%sSpeed:%s %s%-10s%s %sData:%s %s/%s  %sETA:%s %s%s%s",
 				Bold, Reset, Green, formatSpeed(speed), Reset,
 				Bold, Reset, formatBytes(completed), formatBytes(total),
 				Bold, Reset, Yellow, formatTime(etaSec), Reset)
-			frame = append(frame, metrics+ClearLine)
+			frame = append(frame, "\r"+metrics+ClearLine)
 		}
-		frame = append(frame, ClearLine)
+		frame = append(frame, "\r"+ClearLine)
 
-		used := len(frame)
-		for i := 0; i < lines-used-4; i++ {
-			frame = append(frame, ClearLine)
+		for len(frame) < lines-3 {
+			frame = append(frame, "\r"+ClearLine)
 		}
 
 		if statusMsg != "" {
-			frame = append(frame, fmt.Sprintf("%sℹ %s%s", Cyan, statusMsg, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("%sℹ %s%s", Cyan, statusMsg, Reset)+ClearLine)
 			statusMsg = ""
 		} else {
-			frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+			frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 		}
 
 		var controls string
 		if statusText == "complete" {
-			controls = fmt.Sprintf("%s[Enter/q]%s Return to Search   %s[o]%s Open File in Player", Bold, Reset, Bold, Reset)
+			controls = fmt.Sprintf("%s[Enter/q]%s Return   %s[o]%s Open in Player", Bold, Reset, Bold, Reset)
 		} else if statusText == "removed" || statusText == "error" {
 			controls = fmt.Sprintf("%s[Enter/q]%s Return to Search", Bold, Reset)
 		} else {
@@ -822,11 +830,11 @@ func downloadDashboard(item TorrentItem, destDir string) {
 			if isPaused {
 				pLabel = "Resume"
 			}
-			controls = fmt.Sprintf("%s[p/Space]%s %s   %s[c]%s Cancel   %s[b]%s Run in Background   %s[q]%s Return", Bold, Reset, pLabel, Bold, Reset, Bold, Reset, Bold, Reset)
+			controls = fmt.Sprintf("%s[p]%s %s  %s[c]%s Cancel  %s[b]%s Background  %s[q]%s Return", Bold, Reset, pLabel, Bold, Reset, Bold, Reset, Bold, Reset)
 		}
-		frame = append(frame, controls+ClearLine)
+		frame = append(frame, "\r"+controls+ClearLine)
 
-		fmt.Print(strings.Join(frame, "\n"))
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
 
 		if statusText == "complete" {
 			sendNotification("Torq Download Complete!", fileName+" finished downloading.")
@@ -863,9 +871,9 @@ func downloadDashboard(item TorrentItem, destDir string) {
 					statusMsg = "Download Cancelled"
 				}
 			case "b":
-				fmt.Print("\033[?25h\n")
-				fmt.Printf("\n%s✔ Download running in background!%s\n", Green, Reset)
-				fmt.Printf("%sSaved to: %s%s\n\n", Dim, destDir, Reset)
+				fmt.Print("\033[?25h\r\n")
+				fmt.Printf("\n%s✔ Download running in background!%s\r\n", Green, Reset)
+				fmt.Printf("%sSaved to: %s%s\r\n\r\n", Dim, destDir, Reset)
 				return
 			case "q", "quit":
 				if gid != "" {
@@ -1020,7 +1028,7 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 		defer term.Restore(fd, oldState)
 	}
 	fmt.Print("\033[?25l" + ClearScrn)
-	defer fmt.Print("\033[?25h\n")
+	defer fmt.Print("\033[?25h\r\n")
 
 	tierFilters := append([]string{"ALL"}, qualityOrder...)
 	currentTierIdx := 0
@@ -1067,10 +1075,27 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 			}
 		}
 
-		itemsPerPage := (lines - 7) / 2
-		if itemsPerPage < 3 {
-			itemsPerPage = 3
+		divLen := cols - 2
+		if divLen > 78 {
+			divLen = 78
 		}
+		if divLen < 1 {
+			divLen = 1
+		}
+
+		fixedLines := 4
+		if searchFilter != "" {
+			fixedLines++
+		}
+		availLines := lines - fixedLines - 1
+		if availLines < 4 {
+			availLines = 4
+		}
+		itemsPerPage := availLines / 2
+		if itemsPerPage < 2 {
+			itemsPerPage = 2
+		}
+
 		totalPages := int(math.Ceil(float64(totalItems) / float64(itemsPerPage)))
 		if totalPages < 1 {
 			totalPages = 1
@@ -1087,47 +1112,65 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 		}
 
 		var frame []string
-		frame = append(frame, MoveTop)
 
 		tierLabel := targetTier
 		if s, ok := qualityShort[targetTier]; ok {
 			tierLabel = s
 		}
 		qDisp := initialQuery
-		if len(qDisp) > 18 {
-			qDisp = qDisp[:18]
+		if len(qDisp) > 16 {
+			qDisp = qDisp[:16]
 		}
-		hdr := fmt.Sprintf("%s%s⚡ TORQ TUI%s | %s%s%s%s | Tier: %s[%s]%s | Src: %s[%s]%s | Pg: %s%d/%d%s",
-			Bold, Cyan, Reset, Bold, Yellow, qDisp, Reset, Magenta, tierLabel, Reset, Blue, targetSource, Reset, Bold, currentPage, totalPages, Reset)
-		frame = append(frame, hdr+ClearLine)
-
-		divLen := cols - 1
-		if divLen > 78 {
-			divLen = 78
+		srcLabel := targetSource
+		if srcLabel == "ThePirateBay" {
+			srcLabel = "TPB"
 		}
-		if divLen < 1 {
-			divLen = 1
-		}
+		hdr := fmt.Sprintf("%s%s⚡ TORQ%s | %s%s%s%s | %s%s%s | %s%s%s | Pg: %s%d/%d%s",
+			Bold, Cyan, Reset,
+			Bold, Yellow, qDisp, Reset,
+			Magenta, tierLabel, Reset,
+			Blue, srcLabel, Reset,
+			Bold, currentPage, totalPages, Reset)
+		frame = append(frame, "\r"+hdr+ClearLine)
+		frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 
 		if searchFilter != "" {
-			frame = append(frame, fmt.Sprintf("%sFilter (/): %s%s", Yellow, searchFilter, Reset)+ClearLine)
-		} else {
-			frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("%sFilter (/): %s%s", Yellow, searchFilter, Reset)+ClearLine)
 		}
 
 		if totalItems == 0 {
-			frame = append(frame, fmt.Sprintf("\n   %sNo torrents found matching active filters.%s", Yellow, Reset)+ClearLine)
-			frame = append(frame, fmt.Sprintf("   %sPress 't' to reset quality tier or 's' to reset source.%s", Dim, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("   %sNo torrents found matching active filters.%s", Yellow, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("   %sPress 't' to change tier or 's' to change source.%s", Dim, Reset)+ClearLine)
 		} else {
-			currentSection := ""
 			for idx := startIdx; idx < endIdx; idx++ {
 				it := filtered[idx]
 				isActive := (idx == selectedIdx)
 
-				if targetTier == "ALL" && it.Tier != currentSection {
-					currentSection = it.Tier
-					color := qualityColors[it.Tier]
-					frame = append(frame, fmt.Sprintf("%s── %s ──%s", color, it.Tier, Reset)+ClearLine)
+				badge := ""
+				switch it.Tier {
+				case "Highest Quality (4K / UHD / Remux)":
+					badge = Magenta + "[4K]" + Reset
+				case "High Quality (1080p / FHD / BD)":
+					badge = Green + "[1080p]" + Reset
+				case "Medium Quality (720p / HD)":
+					badge = Yellow + "[720p]" + Reset
+				case "Low Quality (480p / SD / CAM)":
+					badge = Red + "[480p]" + Reset
+				default:
+					badge = Cyan + "[General]" + Reset
+				}
+
+				maxTitle := cols - 18
+				if maxTitle < 12 {
+					maxTitle = 12
+				}
+				titleDisp := truncateRunes(it.Title, maxTitle)
+
+				var line1 string
+				if isActive {
+					line1 = fmt.Sprintf(" %s %s[%2d]%s %s %s%s%s", HlArrow, Cyan, idx+1, Reset, badge, HlBg, titleDisp, Reset)
+				} else {
+					line1 = fmt.Sprintf("   %s[%2d]%s %s %s", Cyan, idx+1, Reset, badge, titleDisp)
 				}
 
 				sColor := Red
@@ -1137,43 +1180,38 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 					sColor = Yellow
 				}
 
-				titleDisp := it.Title
-				if len(titleDisp) > cols-14 && cols > 14 {
-					titleDisp = titleDisp[:cols-14]
+				itemSrc := it.Source
+				if itemSrc == "ThePirateBay" {
+					itemSrc = "TPB"
 				}
 
-				srcTag := fmt.Sprintf("%s[%s]%s", Magenta, it.Source, Reset)
-				if isActive {
-					line1 := fmt.Sprintf("%s %s[%2d] %s%s", HlArrow, HlBg, idx+1, titleDisp, Reset)
-					line2 := fmt.Sprintf("   %s Size: %s%s%s | Seeders: %s%d%s | Leechers: %s%d%s | %s%s%s",
-						srcTag, Yellow, it.Size, Reset, sColor, it.Seeders, Reset, Dim, it.Leechers, Reset, Dim, it.Category, Reset)
-					frame = append(frame, line1+ClearLine, line2+ClearLine)
-				} else {
-					line1 := fmt.Sprintf("   %s[%2d]%s %s", Cyan, idx+1, Reset, titleDisp)
-					line2 := fmt.Sprintf("   %s Size: %s%s%s | Seeders: %s%d%s | Leechers: %s%d%s | %s%s%s",
-						srcTag, Yellow, it.Size, Reset, sColor, it.Seeders, Reset, Dim, it.Leechers, Reset, Dim, it.Category, Reset)
-					frame = append(frame, line1+ClearLine, line2+ClearLine)
-				}
+				line2 := fmt.Sprintf("       %s[%s]%s  %s%s%s  ▲ %s%d%s  ▼ %s%d%s",
+					Magenta, itemSrc, Reset,
+					Yellow, it.Size, Reset,
+					sColor, it.Seeders, Reset,
+					Dim, it.Leechers, Reset)
+
+				frame = append(frame, "\r"+line1+ClearLine)
+				frame = append(frame, "\r"+line2+ClearLine)
 			}
 		}
 
-		used := len(frame)
-		for i := 0; i < lines-used-2; i++ {
-			frame = append(frame, ClearLine)
+		for len(frame) < lines-2 {
+			frame = append(frame, "\r"+ClearLine)
 		}
 
 		if statusMsg != "" {
-			frame = append(frame, fmt.Sprintf("%s✔ %s%s", Green, statusMsg, Reset)+ClearLine)
+			frame = append(frame, "\r"+fmt.Sprintf("%s✔ %s%s", Green, statusMsg, Reset)+ClearLine)
 			statusMsg = ""
 		} else {
-			frame = append(frame, Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
+			frame = append(frame, "\r"+Dim+strings.Repeat("━", divLen)+Reset+ClearLine)
 		}
 
-		footer := fmt.Sprintf("%s[▲/▼]%s Nav  %s[Enter/d]%s Download  %s[Q]%s Queue  %s[m]%s Magnet  %s[t]%s Tier  %s[s]%s Source  %s[q]%s Quit",
-			Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
-		frame = append(frame, footer+ClearLine)
+		footer := fmt.Sprintf("%s[▲/▼]%s Move  %s[Enter]%s Download  %s[t]%s Tier  %s[s]%s Src  %s[/]%s Filter  %s[q]%s Quit",
+			Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset, Bold, Reset)
+		frame = append(frame, "\r"+footer+ClearLine)
 
-		fmt.Print(strings.Join(frame, "\n"))
+		fmt.Print(MoveTop + strings.Join(frame, "\r\n") + "\r")
 
 		k := readKey(fd)
 		switch k {
@@ -1214,26 +1252,26 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 			fmt.Print("\033[?25l" + ClearScrn)
 		case "/":
 			term.Restore(fd, oldState)
-			fmt.Print("\033[?25h\n\033[KEnter filter text (Enter to apply, empty to clear): ")
+			fmt.Print("\r\n\033[KEnter filter text (Enter to apply, empty to clear): ")
 			reader := bufio.NewReader(os.Stdin)
 			lineInput, _ := reader.ReadString('\n')
 			searchFilter = strings.TrimSpace(lineInput)
 			oldState, _ = term.MakeRaw(fd)
-			fmt.Print("\033[?25l")
+			fmt.Print("\033[?25l" + ClearScrn)
 			selectedIdx = 0
 		case "m", "M":
 			if totalItems > 0 {
 				item := filtered[selectedIdx]
 				if copyToClipboard(item.Magnet) {
 					shortTitle := item.Title
-					if len(shortTitle) > 32 {
-						shortTitle = shortTitle[:32]
+					if len(shortTitle) > 30 {
+						shortTitle = shortTitle[:30]
 					}
-					statusMsg = fmt.Sprintf("Magnet copied to clipboard! (%s...)", shortTitle)
+					statusMsg = fmt.Sprintf("Magnet copied! (%s...)", shortTitle)
 				} else {
 					shortMag := item.Magnet
-					if len(shortMag) > 50 {
-						shortMag = shortMag[:50]
+					if len(shortMag) > 40 {
+						shortMag = shortMag[:40]
 					}
 					statusMsg = fmt.Sprintf("Magnet: %s...", shortMag)
 				}
@@ -1244,8 +1282,8 @@ func runTUI(allItems []TorrentItem, initialQuery string) {
 				hasSpace, freeB := checkDiskSpace(destDir, item.RawSize)
 				if !hasSpace {
 					term.Restore(fd, oldState)
-					fmt.Printf("\n%s%s⚠️  DISK SPACE WARNING%s\n", Bold, Red, Reset)
-					fmt.Printf("Torrent Size: %s%s%s | Free on storage: %s%s%s\n", Yellow, item.Size, Reset, Red, formatBytes(freeB), Reset)
+					fmt.Printf("\r\n%s%s⚠️  DISK SPACE WARNING%s\r\n", Bold, Red, Reset)
+					fmt.Printf("Torrent Size: %s%s%s | Free: %s%s%s\r\n", Yellow, item.Size, Reset, Red, formatBytes(freeB), Reset)
 					fmt.Printf("%sProceed anyway? [y/N]: %s", Bold, Reset)
 					reader := bufio.NewReader(os.Stdin)
 					ans, _ := reader.ReadString('\n')
